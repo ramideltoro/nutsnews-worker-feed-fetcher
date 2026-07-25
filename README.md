@@ -6,7 +6,7 @@ Deployable worker-uplift feed fetcher service shell for NutsNews.
 
 Own the fetcher service boundary that will consume contracted feed-fetch requests, safely download RSS/Atom feeds, and publish normalized feed-fetch results for canonicalization without touching legacy ingestion.
 
-Issue #95 bootstraps the deployable shell. Issue #96 adds bounded conditional HTTP fetching, RSS/Atom parsing, idempotent fetch metadata, and contract-valid canonicalization candidate publication. Retry/DLQ hardening remains in the next pipeline issue.
+Issue #95 bootstraps the deployable shell. Issue #96 adds bounded conditional HTTP fetching, RSS/Atom parsing, idempotent fetch metadata, and contract-valid canonicalization candidate publication. Issue #97 hardens retry classification, SSRF redirect checks, bounded `Retry-After` evidence, and durable DLQ diagnostics.
 
 ## Owner
 
@@ -50,6 +50,7 @@ Important variables:
 - `NUTSNEWS_FETCHER_TOTAL_TIMEOUT_MS`
 - `NUTSNEWS_FETCHER_MAX_REDIRECTS`
 - `NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES`
+- `NUTSNEWS_FETCHER_RETRY_AFTER_MAX_MS`
 - `NUTSNEWS_FETCHER_ACCEPTED_CONTENT_TYPES`
 
 `NUTSNEWS_FETCHER_SHADOW_MODE` must remain `true` until backend-owned cutover work explicitly changes the deployment contract.
@@ -61,7 +62,11 @@ The service registers the contracted `fetch` consumer route and `canonicalizatio
 The fetch handler:
 
 - sends conditional `If-None-Match` and `If-Modified-Since` headers from durable fetch metadata;
-- enforces configured user agent, timeout, redirect, content-type, and response-size bounds;
+- enforces configured user agent, timeout, redirect, content-type, and streaming response-size bounds;
+- blocks unsupported protocols, loopback, link-local, metadata, and private destinations on the initial URL and each redirect;
+- classifies DNS, connect, TLS, timeout, redirect, HTTP status, content type, oversize, malformed XML, parser, and contract-validation failures;
+- retries only transient failure classes through the bounded shared retry tiers and records safe `Retry-After` values up to `NUTSNEWS_FETCHER_RETRY_AFTER_MAX_MS`;
+- sends permanent and exhausted failures to the fetch DLQ with redacted feed-health diagnostics for replay triage;
 - parses RSS 2.x and Atom with namespace, CDATA, relative link, date, language, excerpt, and image-hint support;
 - records fetch outcomes without raw feed bodies;
 - publishes one contract-valid canonicalization message per new candidate identity;

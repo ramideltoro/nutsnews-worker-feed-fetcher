@@ -19,10 +19,15 @@ export interface ParsedFeedItem {
   readonly language?: string;
 }
 
+export type FeedParseFailureCode = "malformed-xml" | "unsupported-feed" | "parser-error";
+
 export class FeedParseError extends Error {
-  constructor(message: string) {
+  readonly code: FeedParseFailureCode;
+
+  constructor(message: string, code: FeedParseFailureCode = "parser-error") {
     super(message);
     this.name = "FeedParseError";
+    this.code = code;
   }
 }
 
@@ -41,10 +46,20 @@ const MAX_TEXT_LENGTH = 2_048;
 const MAX_EXCERPT_LENGTH = 512;
 
 export function parseFeedXml(xml: string, feedUrl: string, feedId: string): ParsedFeed {
-  const root = asRecord(parser.parse(xml));
+  assertLikelyWellFormedXml(xml);
+
+  let parsed: unknown;
+
+  try {
+    parsed = parser.parse(xml);
+  } catch (error: unknown) {
+    throw new FeedParseError(error instanceof Error ? error.message : "Feed XML parser failed.", "parser-error");
+  }
+
+  const root = asRecord(parsed);
 
   if (root === undefined) {
-    throw new FeedParseError("Feed XML did not parse to an object.");
+    throw new FeedParseError("Feed XML did not parse to an object.", "parser-error");
   }
 
   const rss = asRecord(root.rss);
@@ -59,14 +74,14 @@ export function parseFeedXml(xml: string, feedUrl: string, feedId: string): Pars
     return parseAtom(feed, feedUrl, feedId);
   }
 
-  throw new FeedParseError("Unsupported feed XML root.");
+  throw new FeedParseError("Unsupported feed XML root.", "unsupported-feed");
 }
 
 function parseRss(rss: XmlRecord, feedUrl: string, feedId: string): ParsedFeed {
   const channel = firstRecord(rss.channel);
 
   if (channel === undefined) {
-    throw new FeedParseError("RSS feed is missing channel.");
+    throw new FeedParseError("RSS feed is missing channel.", "unsupported-feed");
   }
 
   const sourceName = boundedText(textValue(channel.title), feedId);
@@ -378,4 +393,148 @@ function parseOptionalDate(value: string | undefined): string | undefined {
   const time = date.getTime();
 
   return Number.isNaN(time) ? undefined : date.toISOString();
+}
+
+function assertLikelyWellFormedXml(xml: string): void {
+  const openTags: string[] = [];
+  let index = 0;
+
+  for (;;) {
+    const tagStart = xml.indexOf("<", index);
+
+    if (tagStart === -1) {
+      break;
+    }
+
+    if (startsWithAt(xml, "<!--", tagStart)) {
+      index = afterRequiredToken(xml, "-->", tagStart + 4);
+      continue;
+    }
+
+    if (startsWithAt(xml, "<![CDATA[", tagStart)) {
+      index = afterRequiredToken(xml, "]]>", tagStart + 9);
+      continue;
+    }
+
+    if (startsWithAt(xml, "<?", tagStart)) {
+      index = afterRequiredToken(xml, "?>", tagStart + 2);
+      continue;
+    }
+
+    const tagEnd = findTagEnd(xml, tagStart + 1);
+
+    if (tagEnd === -1) {
+      throw new FeedParseError("Feed XML tag is not closed.", "malformed-xml");
+    }
+
+    const firstTagChar = xml[tagStart + 1];
+
+    if (firstTagChar === "!") {
+      index = tagEnd + 1;
+      continue;
+    }
+
+    const closing = firstTagChar === "/";
+    const tagNameStart = closing ? tagStart + 2 : tagStart + 1;
+    const tagName = readTagName(xml, tagNameStart);
+
+    if (tagName.length === 0) {
+      throw new FeedParseError("Feed XML tag is missing a name.", "malformed-xml");
+    }
+
+    if (closing) {
+      const opened = openTags.pop();
+
+      if (opened !== tagName) {
+        throw new FeedParseError("Feed XML closing tag does not match.", "malformed-xml");
+      }
+    } else if (!isSelfClosingTag(xml, tagEnd)) {
+      openTags.push(tagName);
+    }
+
+    index = tagEnd + 1;
+  }
+
+  if (openTags.length > 0) {
+    throw new FeedParseError("Feed XML has unclosed tags.", "malformed-xml");
+  }
+}
+
+function startsWithAt(value: string, token: string, index: number): boolean {
+  return value.slice(index, index + token.length) === token;
+}
+
+function afterRequiredToken(value: string, token: string, fromIndex: number): number {
+  const tokenIndex = value.indexOf(token, fromIndex);
+
+  if (tokenIndex === -1) {
+    throw new FeedParseError("Feed XML special section is not closed.", "malformed-xml");
+  }
+
+  return tokenIndex + token.length;
+}
+
+function findTagEnd(value: string, fromIndex: number): number {
+  let quote: string | undefined;
+
+  for (let index = fromIndex; index < value.length; index += 1) {
+    const char = value[index];
+
+    if (char === undefined) {
+      continue;
+    }
+
+    if (quote !== undefined) {
+      if (char === quote) {
+        quote = undefined;
+      }
+
+      continue;
+    }
+
+    if (char === "\"" || char === "'") {
+      quote = char;
+      continue;
+    }
+
+    if (char === ">") {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function readTagName(value: string, fromIndex: number): string {
+  let output = "";
+
+  for (let index = fromIndex; index < value.length; index += 1) {
+    const char = value[index];
+
+    if (char === undefined || isWhitespace(char) || char === "/" || char === ">") {
+      break;
+    }
+
+    output += char;
+  }
+
+  return output;
+}
+
+function isSelfClosingTag(value: string, tagEnd: number): boolean {
+  for (let index = tagEnd - 1; index >= 0; index -= 1) {
+    const char = value[index];
+
+    if (char === undefined) {
+      continue;
+    }
+
+    if (isWhitespace(char)) {
+      continue;
+    }
+
+    return char === "/";
+  }
+
+  return false;
 }

@@ -23,6 +23,7 @@ describe("loadFetcherConfig", () => {
       prefetch: 16,
       shadowMode: true,
       fetchPolicy: {
+        maxRetryAfterMs: 1_800_000,
         acceptedContentTypes: [
           "application/rss+xml",
           "application/atom+xml",

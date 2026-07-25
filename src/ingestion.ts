@@ -24,6 +24,8 @@ import type { FetcherConfig } from "./config.js";
 import type {
   FetcherCandidateReference,
   FetcherDependencies,
+  FetcherFailureClass,
+  FetcherFailureDetails,
   FetcherFetchOutcome,
   FetcherHttpResponse,
   FetcherWorkHandler,
@@ -57,6 +59,28 @@ interface FeedFetchRequest {
   readonly traceparent: string;
   readonly maxItems: number;
   readonly timeoutMs: number;
+  readonly attemptCount: number;
+  readonly maxAttempts: number;
+}
+
+interface FetcherFailureDecision {
+  readonly failureClass: FetcherFailureClass;
+  readonly code: string;
+  readonly fetchStatus: Extract<FetcherFetchOutcome["fetchStatus"], "transient_failure" | "permanent_failure">;
+  readonly telemetryOutcome: Extract<RuntimeTelemetryOutcome, "retry" | "failure">;
+  readonly retryable: boolean;
+  readonly diagnosticSample: string;
+  readonly retryAfterMs?: number;
+}
+
+class FetcherPayloadValidationError extends Error {
+  readonly issueRefs: readonly string[];
+
+  constructor(issueRefs: readonly string[]) {
+    super(`Canonicalization payload failed validation: ${issueRefs.join(",")}`);
+    this.name = "FetcherPayloadValidationError";
+    this.issueRefs = issueRefs;
+  }
 }
 
 const FETCH_QUEUE = getWorkerRoute("fetch").mainQueue.name;
@@ -88,21 +112,11 @@ async function handleFeedFetch(
     const dnsDecision = await options.dependencies.dnsPolicy.evaluate(feedUrl);
 
     if (!dnsDecision.allowed) {
-      await recordAndObserve(options, {
-        feedId: request.feedId,
-        feedUrl: request.feedUrl,
-        fetchedAt,
-        fetchStatus: "permanent_failure",
-        bodyBytes: 0,
-        itemCount: 0,
-        durationMs: elapsedMs(options, startedAtMs),
-        diagnosticSample: dnsDecision.reason
-      }, "failure");
+      const failure = permanentFailure("security", dnsDecision.reason, dnsDecision.reason);
 
-      return {
-        status: "terminal-failure",
-        reason: dnsDecision.reason
-      };
+      await recordFailure(options, request, fetchedAt, elapsedMs(options, startedAtMs), failure);
+
+      return resultFromFailure(failure);
     }
 
     const metadata = await options.dependencies.stateStore.getFeedMetadata(request.feedId);
@@ -114,7 +128,8 @@ async function handleFeedFetch(
       readTimeoutMs: options.config.fetchPolicy.readTimeoutMs,
       totalTimeoutMs: request.timeoutMs,
       maxRedirects: options.config.fetchPolicy.maxRedirects,
-      maxResponseBytes: options.config.fetchPolicy.maxResponseBytes
+      maxResponseBytes: options.config.fetchPolicy.maxResponseBytes,
+      redirectPolicy: options.dependencies.dnsPolicy
     });
 
     if (response.statusCode === 304) {
@@ -144,30 +159,27 @@ async function handleFeedFetch(
     }
 
     if (isTransientStatus(response.statusCode)) {
-      await recordHttpFailure(options, request, response, fetchedAt, "transient_failure", "retry");
+      const failure = transientFailure("http_status", `http-${String(response.statusCode)}`, response.headers["content-type"] ?? `http-${String(response.statusCode)}`, retryAfterMs(response.headers["retry-after"], fetchedAt, options.config.fetchPolicy.maxRetryAfterMs));
 
-      return {
-        status: "retry",
-        reason: `http-${String(response.statusCode)}`
-      };
+      await recordHttpFailure(options, request, response, fetchedAt, failure);
+
+      return resultFromFailure(failure);
     }
 
     if (response.statusCode < 200 || response.statusCode >= 300) {
-      await recordHttpFailure(options, request, response, fetchedAt, "permanent_failure", "failure");
+      const failure = permanentFailure("http_status", `http-${String(response.statusCode)}`, response.headers["content-type"] ?? `http-${String(response.statusCode)}`);
 
-      return {
-        status: "terminal-failure",
-        reason: `http-${String(response.statusCode)}`
-      };
+      await recordHttpFailure(options, request, response, fetchedAt, failure);
+
+      return resultFromFailure(failure);
     }
 
     if (!isAcceptedContentType(response.headers["content-type"], options.config.fetchPolicy.acceptedContentTypes)) {
-      await recordHttpFailure(options, request, response, fetchedAt, "permanent_failure", "failure");
+      const failure = permanentFailure("content_type", "unsupported-content-type", response.headers["content-type"] ?? "missing-content-type");
 
-      return {
-        status: "terminal-failure",
-        reason: "unsupported-content-type"
-      };
+      await recordHttpFailure(options, request, response, fetchedAt, failure);
+
+      return resultFromFailure(failure);
     }
 
     const contentFingerprint = sha256Hex(response.body);
@@ -195,6 +207,9 @@ async function handleFeedFetch(
     const itemRefs = parsed.items
       .slice(0, request.maxItems)
       .map((item) => candidateReference(request.feedId, contentFingerprint, item));
+    const publishCommands = itemRefs.map((itemRef) =>
+      createCanonicalizationPublishCommand(context, request, itemRef, idFactory, options.config, contentFingerprint, fetchedAt)
+    );
 
     await recordAndObserve(options, {
       feedId: request.feedId,
@@ -209,7 +224,7 @@ async function handleFeedFetch(
       itemRefs
     }, "success");
 
-    for (const itemRef of itemRefs) {
+    for (const [index, itemRef] of itemRefs.entries()) {
       const claim = await options.dependencies.stateStore.claimCandidate(itemRef.candidateId, {
         feedId: request.feedId,
         sourceItemId: itemRef.sourceItemId,
@@ -221,7 +236,12 @@ async function handleFeedFetch(
         continue;
       }
 
-      const command = createCanonicalizationPublishCommand(context, request, itemRef, idFactory, options.config, contentFingerprint, fetchedAt);
+      const command = publishCommands[index];
+
+      if (command === undefined) {
+        throw new Error("Candidate publish command missing for item reference.");
+      }
+
       const receipt = await tools.publish(command);
       await options.dependencies.stateStore.markCandidatePublished(itemRef.candidateId, {
         publishedAt: runtimeNow(options.dependencies.clock),
@@ -245,57 +265,11 @@ async function handleFetchError(
   fetchedAt: string,
   durationMs: number
 ): Promise<RuntimeHandlerResult> {
-  if (error instanceof FeedParseError) {
-    await recordAndObserve(options, {
-      feedId: request.feedId,
-      feedUrl: request.feedUrl,
-      fetchedAt,
-      fetchStatus: "permanent_failure",
-      bodyBytes: 0,
-      itemCount: 0,
-      durationMs,
-      diagnosticSample: diagnosticSample(error.message)
-    }, "failure");
+  const failure = classifyFailure(error);
 
-    return {
-      status: "terminal-failure",
-      reason: error.name
-    };
-  }
+  await recordFailure(options, request, fetchedAt, durationMs, failure);
 
-  if (error instanceof FetcherHttpError && error.name === "ResponseTooLargeError") {
-    await recordAndObserve(options, {
-      feedId: request.feedId,
-      feedUrl: request.feedUrl,
-      fetchedAt,
-      fetchStatus: "permanent_failure",
-      bodyBytes: 0,
-      itemCount: 0,
-      durationMs,
-      diagnosticSample: diagnosticSample(error.name)
-    }, "failure");
-
-    return {
-      status: "terminal-failure",
-      reason: error.name
-    };
-  }
-
-  await recordAndObserve(options, {
-    feedId: request.feedId,
-    feedUrl: request.feedUrl,
-    fetchedAt,
-    fetchStatus: "transient_failure",
-    bodyBytes: 0,
-    itemCount: 0,
-    durationMs,
-    diagnosticSample: diagnosticSample(classifyError(error))
-  }, "retry");
-
-  return {
-    status: "retry",
-    reason: classifyError(error)
-  };
+  return resultFromFailure(failure);
 }
 
 function feedFetchRequestFromContext(context: RuntimeMessageContext, config: FetcherConfig): FeedFetchRequest {
@@ -309,7 +283,9 @@ function feedFetchRequestFromContext(context: RuntimeMessageContext, config: Fet
     pipelineRunId: stringValue(context.payload.pipelineRunId, "pipelineRunId"),
     traceparent: stringValue(context.payload.traceparent, "traceparent"),
     timeoutMs: Math.min(payloadTimeoutMs ?? config.fetchPolicy.totalTimeoutMs, config.fetchPolicy.totalTimeoutMs),
-    maxItems: Math.min(Math.max(payloadMaxItems ?? DEFAULT_MAX_ITEMS, 0), MAX_ITEMS)
+    maxItems: Math.min(Math.max(payloadMaxItems ?? DEFAULT_MAX_ITEMS, 0), MAX_ITEMS),
+    attemptCount: context.envelope.attempt.count,
+    maxAttempts: context.envelope.attempt.max
   };
 }
 
@@ -349,7 +325,7 @@ function createCanonicalizationPublishCommand(
   const validation = validateStagePayload(payload);
 
   if (!validation.ok) {
-    throw new Error(`Invalid canonicalization payload: ${validation.issues.map((issue) => `${issue.path}:${issue.code}`).join(",")}`);
+    throw new FetcherPayloadValidationError(validation.issues.map((issue) => `${issue.path}:${issue.code}`));
   }
 
   return {
@@ -431,20 +407,39 @@ async function recordHttpFailure(
   request: FeedFetchRequest,
   response: FetcherHttpResponse,
   fetchedAt: string,
-  fetchStatus: FetcherFetchOutcome["fetchStatus"],
-  outcome: RuntimeTelemetryOutcome
+  failure: FetcherFailureDecision
+): Promise<void> {
+  await recordFailure(options, request, fetchedAt, response.durationMs, failure, {
+    httpStatus: response.statusCode,
+    bodyBytes: response.bodyBytes
+  });
+}
+
+async function recordFailure(
+  options: FeedFetchWorkHandlerOptions,
+  request: FeedFetchRequest,
+  fetchedAt: string,
+  durationMs: number,
+  failure: FetcherFailureDecision,
+  observed: {
+    readonly httpStatus?: number;
+    readonly bodyBytes?: number;
+  } = {}
 ): Promise<void> {
   await recordAndObserve(options, {
     feedId: request.feedId,
     feedUrl: request.feedUrl,
     fetchedAt,
-    fetchStatus,
-    httpStatus: response.statusCode,
-    bodyBytes: response.bodyBytes,
+    fetchStatus: failure.fetchStatus,
+    ...(observed.httpStatus === undefined ? {} : {
+      httpStatus: observed.httpStatus
+    }),
+    bodyBytes: observed.bodyBytes ?? 0,
     itemCount: 0,
-    durationMs: response.durationMs,
-    diagnosticSample: response.headers["content-type"] ?? `http-${String(response.statusCode)}`
-  }, outcome);
+    durationMs,
+    diagnosticSample: diagnosticSample(failure.diagnosticSample),
+    failure: failureDetails(request, failure, observed.httpStatus)
+  }, failure.telemetryOutcome);
 }
 
 async function recordAndObserve(
@@ -469,7 +464,16 @@ async function recordAndObserve(
       fetchStatus: outcome.fetchStatus,
       statusClass: statusClass(outcome.httpStatus),
       bytes: outcome.bodyBytes,
-      itemCount: outcome.itemCount
+      itemCount: outcome.itemCount,
+      ...(outcome.failure === undefined ? {} : {
+        failureClass: outcome.failure.failureClass,
+        failureCode: outcome.failure.code,
+        failureAction: outcome.failure.action,
+        retryable: outcome.failure.retryable,
+        ...(outcome.failure.retryAfterMs === undefined ? {} : {
+          retryAfterMs: outcome.failure.retryAfterMs
+        })
+      })
     }
   });
 }
@@ -551,12 +555,224 @@ function integerValue(value: unknown): number | undefined {
   return Number.isInteger(value) ? value as number : undefined;
 }
 
-function classifyError(error: unknown): string {
+function resultFromFailure(failure: FetcherFailureDecision): RuntimeHandlerResult {
+  if (failure.retryable) {
+    return failure.retryAfterMs === undefined
+      ? {
+          status: "retry",
+          reason: failure.code
+        }
+      : {
+          status: "retry",
+          reason: failure.code,
+          retryAfterMs: failure.retryAfterMs
+        };
+  }
+
+  return {
+    status: "terminal-failure",
+    reason: failure.code
+  };
+}
+
+function failureDetails(
+  request: FeedFetchRequest,
+  failure: FetcherFailureDecision,
+  httpStatus: number | undefined
+): FetcherFailureDetails {
+  return {
+    failureClass: failure.failureClass,
+    code: failure.code,
+    retryable: failure.retryable,
+    action: failure.retryable && request.attemptCount < request.maxAttempts ? "retry" : "dlq",
+    safeFeedUrl: safeFeedUrl(request.feedUrl),
+    diagnosticSample: diagnosticSample(failure.diagnosticSample),
+    ...(httpStatus === undefined ? {} : {
+      httpStatus
+    }),
+    ...(failure.retryAfterMs === undefined ? {} : {
+      retryAfterMs: failure.retryAfterMs
+    })
+  };
+}
+
+function classifyFailure(error: unknown): FetcherFailureDecision {
+  if (error instanceof FeedParseError) {
+    if (error.code === "malformed-xml") {
+      return permanentFailure("malformed_xml", "malformed-xml", error.message);
+    }
+
+    return permanentFailure("parser", error.code, error.message);
+  }
+
+  if (error instanceof FetcherPayloadValidationError) {
+    return permanentFailure("validation", "canonicalization-payload-validation", error.issueRefs.join(","));
+  }
+
+  if (error instanceof FetcherHttpError) {
+    return classifyFetcherHttpError(error);
+  }
+
+  const code = nestedErrorCode(error);
+
+  if (code === "EAI_AGAIN") {
+    return transientFailure("dns", "dns-temporary-failure", code);
+  }
+
+  if (code === "ENOTFOUND" || code === "ENODATA") {
+    return permanentFailure("dns", "dns-name-not-found", code);
+  }
+
+  if (code !== undefined && isTlsFailureCode(code)) {
+    return permanentFailure("tls", "tls-failure", code);
+  }
+
+  return transientFailure("unknown", "unknown-fetch-error", errorName(error));
+}
+
+function classifyFetcherHttpError(error: FetcherHttpError): FetcherFailureDecision {
+  if (error.name === "ResponseTooLargeError") {
+    return permanentFailure("oversize", "response-too-large", error.name);
+  }
+
+  if (error.name === "RedirectBlockedError") {
+    const policyReason = stringDiagnostic(error.diagnostics.policyReason);
+
+    return permanentFailure("security", policyReason ?? "redirect-blocked", policyReason ?? error.name);
+  }
+
+  if (error.name === "RedirectLimitError" || error.name === "RedirectLocationError") {
+    return permanentFailure("redirect", error.name === "RedirectLimitError" ? "redirect-limit-exceeded" : "redirect-location-missing", error.name);
+  }
+
+  if (error.name === "ConnectTimeoutError") {
+    return transientFailure("connect", "connect-timeout", error.name);
+  }
+
+  if (error.name === "ReadTimeoutError" || error.name === "TotalTimeoutError") {
+    return transientFailure("timeout", error.name === "ReadTimeoutError" ? "read-timeout" : "total-timeout", error.name);
+  }
+
+  return transientFailure("unknown", "http-client-error", error.name);
+}
+
+function transientFailure(
+  failureClass: FetcherFailureClass,
+  code: string,
+  sample: string,
+  retryAfterMsValue?: number
+): FetcherFailureDecision {
+  const base = {
+    failureClass,
+    code,
+    fetchStatus: "transient_failure",
+    telemetryOutcome: "retry",
+    retryable: true,
+    diagnosticSample: sample
+  } as const;
+
+  return retryAfterMsValue === undefined
+    ? base
+    : {
+        ...base,
+        retryAfterMs: retryAfterMsValue
+      };
+}
+
+function permanentFailure(
+  failureClass: FetcherFailureClass,
+  code: string,
+  sample: string
+): FetcherFailureDecision {
+  return {
+    failureClass,
+    code,
+    fetchStatus: "permanent_failure",
+    telemetryOutcome: "failure",
+    retryable: false,
+    diagnosticSample: sample
+  };
+}
+
+function retryAfterMs(header: string | undefined, nowIso: string, maxRetryAfterMs: number): number | undefined {
+  if (header === undefined) {
+    return undefined;
+  }
+
+  const trimmed = header.trim();
+
+  if (trimmed.length === 0) {
+    return undefined;
+  }
+
+  const seconds = Number(trimmed);
+
+  if (Number.isSafeInteger(seconds) && seconds > 0) {
+    const delayMs = seconds * 1_000;
+
+    return delayMs <= maxRetryAfterMs ? delayMs : undefined;
+  }
+
+  const retryAtMs = Date.parse(trimmed);
+  const nowMs = Date.parse(nowIso);
+
+  if (Number.isNaN(retryAtMs) || Number.isNaN(nowMs) || retryAtMs <= nowMs) {
+    return undefined;
+  }
+
+  const delayMs = retryAtMs - nowMs;
+
+  return delayMs <= maxRetryAfterMs ? delayMs : undefined;
+}
+
+function nestedErrorCode(error: unknown): string | undefined {
+  const direct = stringProperty(error, "code");
+
+  if (direct !== undefined) {
+    return direct;
+  }
+
+  const cause = error instanceof Error ? error.cause : undefined;
+
+  return stringProperty(cause, "code");
+}
+
+function stringProperty(value: unknown, key: string): string | undefined {
+  const record = recordValue(value);
+  const property = record?.[key];
+
+  return typeof property === "string" && property.length > 0 ? property : undefined;
+}
+
+function stringDiagnostic(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function isTlsFailureCode(code: string): boolean {
+  return code.startsWith("ERR_TLS") ||
+    code.startsWith("CERT_") ||
+    code.startsWith("DEPTH_ZERO_SELF_SIGNED_CERT") ||
+    code.startsWith("SELF_SIGNED_CERT");
+}
+
+function errorName(error: unknown): string {
   if (error instanceof Error && error.name.length > 0) {
     return error.name;
   }
 
-  return "unknown-fetch-error";
+  return "unknown";
+}
+
+function safeFeedUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    const path = url.pathname === "/" || url.pathname.length === 0 ? "/" : "/[path-redacted]";
+    const query = url.search.length === 0 ? "" : "?[query-redacted]";
+
+    return `${url.protocol}//${url.host}${path}${query}`;
+  } catch {
+    return diagnosticSample(value);
+  }
 }
 
 function diagnosticSample(value: string): string {
