@@ -237,7 +237,24 @@ function textValue(value: unknown): string {
 }
 
 function cleanText(value: string): string {
-  return value.replace(/\s+/gu, " ").replace(/\s+([,.;:!?])/gu, "$1").trim();
+  let output = "";
+  let pendingSpace = false;
+
+  for (const char of value) {
+    if (isWhitespace(char)) {
+      pendingSpace = output.length > 0;
+      continue;
+    }
+
+    if (pendingSpace && !isPunctuation(char)) {
+      output += " ";
+    }
+
+    output += char;
+    pendingSpace = false;
+  }
+
+  return output.trim();
 }
 
 function boundedText(value: string | undefined, fallback: string): string {
@@ -251,9 +268,53 @@ function excerptText(value: string | undefined): string | undefined {
     return undefined;
   }
 
-  const text = cleanText(value.replace(/<[^>]*>/gu, " "));
+  const text = cleanText(stripXmlTags(value));
 
   return text.length === 0 ? undefined : text.slice(0, MAX_EXCERPT_LENGTH);
+}
+
+function stripXmlTags(value: string): string {
+  let output = "";
+  let insideTag = false;
+
+  for (const char of value) {
+    if (char === "<") {
+      insideTag = true;
+      output += " ";
+      continue;
+    }
+
+    if (char === ">") {
+      insideTag = false;
+      output += " ";
+      continue;
+    }
+
+    if (!insideTag) {
+      output += char;
+    }
+  }
+
+  return output;
+}
+
+function isWhitespace(char: string): boolean {
+  return char === " " ||
+    char === "\n" ||
+    char === "\r" ||
+    char === "\t" ||
+    char === "\f" ||
+    char === "\v" ||
+    char === "\u00a0";
+}
+
+function isPunctuation(char: string): boolean {
+  return char === "," ||
+    char === "." ||
+    char === ";" ||
+    char === ":" ||
+    char === "!" ||
+    char === "?";
 }
 
 function resolveUrl(value: string | undefined, baseUrl: string): string | undefined {
