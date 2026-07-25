@@ -28,13 +28,19 @@ import {
 
 import type {
   FetcherDependencies,
+  FetcherCandidateClaim,
+  FetcherCandidateClaimResult,
+  FetcherCandidatePublication,
   FetcherDependencyProbe,
   FetcherDnsPolicy,
   FetcherDnsPolicyDecision,
   FetcherDurableStateStore,
+  FetcherFeedMetadata,
+  FetcherFetchOutcome,
   FetcherHttpClient,
   FetcherHttpRequest,
   FetcherHttpResponse,
+  FetcherWorkTools,
   FetcherWorkHandler
 } from "./dependencies.js";
 
@@ -61,7 +67,10 @@ export class LocalHttpClient implements FetcherHttpClient {
   response: FetcherHttpResponse = {
     statusCode: 200,
     headers: {},
-    bodyBytes: 0
+    body: new Uint8Array(),
+    bodyBytes: 0,
+    finalUrl: "https://feeds.example.test/world.xml",
+    durationMs: 0
   };
 
   probe(): FetcherDependencyProbe {
@@ -113,6 +122,9 @@ export class LocalDnsPolicy implements FetcherDnsPolicy {
 export class InMemoryFetcherStateStore implements FetcherDurableStateStore {
   readonly name: string = "local-durable-state";
   status: FetcherDependencyProbe["status"] = "ok";
+  readonly outcomes: FetcherFetchOutcome[] = [];
+  private readonly feedMetadata = new Map<string, FetcherFeedMetadata>();
+  private readonly candidates = new Map<string, FetcherCandidatePublication>();
   private readonly store;
 
   constructor(clock: RuntimeClock = new ManualFetcherClock()) {
@@ -137,6 +149,54 @@ export class InMemoryFetcherStateStore implements FetcherDurableStateStore {
   markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
     return this.store.markFailed(idempotencyKey, failure);
   }
+
+  getFeedMetadata(feedId: string): Promise<FetcherFeedMetadata | undefined> {
+    return Promise.resolve(this.feedMetadata.get(feedId));
+  }
+
+  recordFetchOutcome(outcome: FetcherFetchOutcome): Promise<void> {
+    this.outcomes.push(outcome);
+
+    if (outcome.fetchStatus === "success" || outcome.fetchStatus === "unchanged") {
+      this.feedMetadata.set(outcome.feedId, {
+        feedId: outcome.feedId,
+        ...(outcome.etag === undefined ? {} : {
+          etag: outcome.etag
+        }),
+        ...(outcome.lastModified === undefined ? {} : {
+          lastModified: outcome.lastModified
+        }),
+        ...(outcome.contentFingerprint === undefined ? {} : {
+          contentFingerprint: outcome.contentFingerprint
+        }),
+        fetchedAt: outcome.fetchedAt
+      });
+    }
+
+    return Promise.resolve();
+  }
+
+  claimCandidate(candidateId: string, claim: FetcherCandidateClaim): Promise<FetcherCandidateClaimResult> {
+    void claim;
+    const existing = this.candidates.get(candidateId);
+
+    if (existing !== undefined) {
+      return Promise.resolve({
+        status: "already-published",
+        publishedAt: existing.publishedAt,
+        messageId: existing.messageId
+      });
+    }
+
+    return Promise.resolve({
+      status: "claimed"
+    });
+  }
+
+  markCandidatePublished(candidateId: string, publication: FetcherCandidatePublication): Promise<void> {
+    this.candidates.set(candidateId, publication);
+    return Promise.resolve();
+  }
 }
 
 export class LocalFetcherWorkHandler implements FetcherWorkHandler {
@@ -148,7 +208,8 @@ export class LocalFetcherWorkHandler implements FetcherWorkHandler {
   handleGate: Promise<void> | undefined;
   onHandleStart: (() => void) | undefined;
 
-  async handle(context: RuntimeMessageContext): Promise<RuntimeHandlerResult> {
+  async handle(context: RuntimeMessageContext, tools: FetcherWorkTools): Promise<RuntimeHandlerResult> {
+    void tools;
     this.onHandleStart?.();
     await this.handleGate;
     this.handled.push(context);
@@ -247,16 +308,25 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
   }
 }
 
-export function createLocalFetcherDependencies(): FetcherDependencies {
-  const clock = new ManualFetcherClock();
+export interface LocalFetcherDependencyOptions {
+  readonly clock?: RuntimeClock;
+  readonly httpClient?: FetcherHttpClient;
+  readonly dnsPolicy?: FetcherDnsPolicy;
+  readonly stateStore?: FetcherDurableStateStore;
+  readonly brokerTransport?: RuntimeBrokerTransport;
+  readonly workHandler?: FetcherWorkHandler;
+}
+
+export function createLocalFetcherDependencies(options: LocalFetcherDependencyOptions = {}): FetcherDependencies {
+  const clock = options.clock ?? new ManualFetcherClock();
 
   return {
     clock,
-    httpClient: new LocalHttpClient(),
-    dnsPolicy: new LocalDnsPolicy(),
-    stateStore: new InMemoryFetcherStateStore(clock),
-    brokerTransport: new LocalBrokerTransport(),
-    workHandler: new LocalFetcherWorkHandler()
+    httpClient: options.httpClient ?? new LocalHttpClient(),
+    dnsPolicy: options.dnsPolicy ?? new LocalDnsPolicy(),
+    stateStore: options.stateStore ?? new InMemoryFetcherStateStore(clock),
+    brokerTransport: options.brokerTransport ?? new LocalBrokerTransport(),
+    workHandler: options.workHandler ?? new LocalFetcherWorkHandler()
   };
 }
 
