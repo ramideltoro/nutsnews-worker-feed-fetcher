@@ -216,6 +216,216 @@ describe("feed fetch ingestion handler", () => {
 
     await context.service.stop();
   });
+
+  it("retries transient HTTP failures with safe bounded Retry-After evidence", async () => {
+    const context = createIngestionContext({
+      statusCode: 429,
+      headers: {
+        "content-type": "text/plain",
+        "retry-after": "120"
+      },
+      body: new Uint8Array(),
+      bodyBytes: 0,
+      finalUrl: "https://feeds.example.test/world.xml",
+      durationMs: 9
+    });
+
+    await context.service.start();
+    await expect(context.broker.deliverFetch()).resolves.toMatchObject({
+      action: "retry",
+      reason: "http-429",
+      retryAfterMs: 120_000
+    });
+
+    expect(context.state.outcomes[0]).toMatchObject({
+      fetchStatus: "transient_failure",
+      httpStatus: 429,
+      failure: {
+        failureClass: "http_status",
+        code: "http-429",
+        retryable: true,
+        action: "retry",
+        retryAfterMs: 120_000
+      }
+    });
+
+    await context.service.stop();
+  });
+
+  it("ignores unsafe Retry-After values above the configured bound", async () => {
+    const context = createIngestionContext({
+      statusCode: 503,
+      headers: {
+        "retry-after": "7200"
+      },
+      body: new Uint8Array(),
+      bodyBytes: 0,
+      finalUrl: "https://feeds.example.test/world.xml",
+      durationMs: 9
+    });
+
+    await context.service.start();
+    const result = await context.broker.deliverFetch();
+
+    expect(result).toMatchObject({
+      action: "retry",
+      reason: "http-503"
+    });
+    expect("retryAfterMs" in result).toBe(false);
+    expect(context.state.outcomes[0]?.failure).toMatchObject({
+      failureClass: "http_status",
+      code: "http-503",
+      retryable: true,
+      action: "retry"
+    });
+    expect(context.state.outcomes[0]?.failure).not.toHaveProperty("retryAfterMs");
+
+    await context.service.stop();
+  });
+
+  it("routes exhausted transient failures to the fetch DLQ with retryable feed-health context", async () => {
+    const context = createIngestionContext({
+      statusCode: 503,
+      headers: {},
+      body: new Uint8Array(),
+      bodyBytes: 0,
+      finalUrl: "https://feeds.example.test/world.xml",
+      durationMs: 9
+    });
+
+    await context.service.start();
+    await expect(context.broker.deliverFetch(createMinimalFetchDelivery({
+      envelope: {
+        messageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3981",
+        idempotencyKey: "scheduler:feed:feed-world:20260723t000200000z",
+        attempt: {
+          count: 4,
+          max: 4,
+          firstAttemptAt: "2026-07-23T00:00:00.000Z",
+          lastAttemptAt: "2026-07-23T00:20:00.000Z"
+        }
+      },
+      payload: {
+        idempotencyKey: "scheduler:feed:feed-world:20260723t000200000z",
+        stageExecutionId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3982"
+      }
+    }))).resolves.toMatchObject({
+      action: "dlq",
+      reason: "http-503"
+    });
+
+    expect(context.state.outcomes[0]).toMatchObject({
+      fetchStatus: "transient_failure",
+      failure: {
+        failureClass: "http_status",
+        code: "http-503",
+        retryable: true,
+        action: "dlq"
+      }
+    });
+
+    await context.service.stop();
+  });
+
+  it("blocks protected feed destinations before opening an HTTP request", async () => {
+    const context = createIngestionContext(rssResponse());
+
+    await context.service.start();
+    await expect(context.broker.deliverFetch(createMinimalFetchDelivery({
+      envelope: {
+        idempotencyKey: "scheduler:feed:feed-world:20260723t000300000z"
+      },
+      payload: {
+        idempotencyKey: "scheduler:feed:feed-world:20260723t000300000z",
+        feedUrl: "http://169.254.169.254/latest/meta-data"
+      }
+    }))).resolves.toMatchObject({
+      action: "dlq",
+      reason: "blocked-metadata-address"
+    });
+
+    expect(context.http.requests).toHaveLength(0);
+    expect(context.state.outcomes[0]).toMatchObject({
+      fetchStatus: "permanent_failure",
+      failure: {
+        failureClass: "security",
+        code: "blocked-metadata-address",
+        retryable: false,
+        action: "dlq",
+        safeFeedUrl: "http://169.254.169.254/[path-redacted]"
+      }
+    });
+
+    await context.service.stop();
+  });
+
+  it("classifies malformed XML as a permanent parser failure", async () => {
+    const body = bytes("<rss><channel><item></rss>");
+    const context = createIngestionContext({
+      statusCode: 200,
+      headers: {
+        "content-type": "application/rss+xml"
+      },
+      body,
+      bodyBytes: body.byteLength,
+      finalUrl: "https://feeds.example.test/world.xml",
+      durationMs: 7
+    });
+
+    await context.service.start();
+    await expect(context.broker.deliverFetch()).resolves.toMatchObject({
+      action: "dlq",
+      reason: "malformed-xml"
+    });
+    expect(context.broker.published).toHaveLength(0);
+    expect(context.state.outcomes[0]).toMatchObject({
+      fetchStatus: "permanent_failure",
+      failure: {
+        failureClass: "malformed_xml",
+        code: "malformed-xml",
+        retryable: false,
+        action: "dlq"
+      }
+    });
+
+    await context.service.stop();
+  });
+
+  it("classifies candidate validation failures as terminal without successful item-ref persistence", async () => {
+    const body = bytes(`<?xml version="1.0"?>
+      <rss><channel><title>World Source</title><item><guid>unsafe</guid><title>Unsafe Link</title><link>https://articles.example.test/story?api_key=secret</link></item></channel></rss>`);
+    const context = createIngestionContext({
+      statusCode: 200,
+      headers: {
+        "content-type": "application/rss+xml"
+      },
+      body,
+      bodyBytes: body.byteLength,
+      finalUrl: "https://feeds.example.test/world.xml",
+      durationMs: 7
+    });
+
+    await context.service.start();
+    await expect(context.broker.deliverFetch()).resolves.toMatchObject({
+      action: "dlq",
+      reason: "canonicalization-payload-validation"
+    });
+
+    expect(context.broker.published).toHaveLength(0);
+    expect(context.state.outcomes).toHaveLength(1);
+    expect(context.state.outcomes[0]).toMatchObject({
+      fetchStatus: "permanent_failure",
+      failure: {
+        failureClass: "validation",
+        code: "canonicalization-payload-validation",
+        retryable: false,
+        action: "dlq"
+      }
+    });
+    expect(JSON.stringify(context.state.outcomes)).not.toContain("secret");
+
+    await context.service.stop();
+  });
 });
 
 function createIngestionContext(response: LocalHttpClient["response"], state = new InMemoryFetcherStateStore()) {

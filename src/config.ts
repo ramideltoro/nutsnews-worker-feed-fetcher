@@ -33,6 +33,7 @@ export const FETCHER_CONFIG_SCHEMA = [
   variable("NUTSNEWS_FETCHER_TOTAL_TIMEOUT_MS", "Total feed fetch timeout in milliseconds.", false, false, "15000"),
   variable("NUTSNEWS_FETCHER_MAX_REDIRECTS", "Maximum safe redirects per feed fetch.", false, false, "3"),
   variable("NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES", "Maximum feed response body size in bytes.", false, false, "1048576"),
+  variable("NUTSNEWS_FETCHER_RETRY_AFTER_MAX_MS", "Maximum Retry-After delay the fetcher will honor for transient feed failures.", false, false, "1800000"),
   variable("NUTSNEWS_FETCHER_ACCEPTED_CONTENT_TYPES", "Comma-separated accepted feed response content types.", false, false, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/rss+xml")
 ] as const satisfies readonly FetcherConfigVariable[];
 
@@ -63,6 +64,7 @@ export interface FetcherConfig {
     readonly totalTimeoutMs: number;
     readonly maxRedirects: number;
     readonly maxResponseBytes: number;
+    readonly maxRetryAfterMs: number;
     readonly acceptedContentTypes: readonly string[];
   };
 }
@@ -119,6 +121,7 @@ export function loadFetcherConfig(env: NodeJS.ProcessEnv = process.env): Fetcher
       totalTimeoutMs,
       maxRedirects: parseInteger(env.NUTSNEWS_FETCHER_MAX_REDIRECTS, "NUTSNEWS_FETCHER_MAX_REDIRECTS", 3, 0, 10, issues),
       maxResponseBytes: parseInteger(env.NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES, "NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES", 1_048_576, 1_024, 16_777_216, issues),
+      maxRetryAfterMs: parseInteger(env.NUTSNEWS_FETCHER_RETRY_AFTER_MAX_MS, "NUTSNEWS_FETCHER_RETRY_AFTER_MAX_MS", 1_800_000, 1_000, 3_600_000, issues),
       acceptedContentTypes: parseContentTypes(env.NUTSNEWS_FETCHER_ACCEPTED_CONTENT_TYPES, issues)
     }
   };

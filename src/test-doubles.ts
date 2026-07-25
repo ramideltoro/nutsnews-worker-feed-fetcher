@@ -105,10 +105,24 @@ export class LocalDnsPolicy implements FetcherDnsPolicy {
       };
     }
 
-    if (url.hostname === "localhost" || url.hostname === "127.0.0.1") {
+    if (url.hostname === "localhost") {
       return {
         allowed: false,
         reason: "blocked-localhost"
+      };
+    }
+
+    if (url.hostname === "127.0.0.1" || url.hostname === "[::1]") {
+      return {
+        allowed: false,
+        reason: "blocked-loopback-address"
+      };
+    }
+
+    if (url.hostname === "169.254.169.254") {
+      return {
+        allowed: false,
+        reason: "blocked-metadata-address"
       };
     }
 

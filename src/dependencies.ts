@@ -16,6 +16,7 @@ export interface FetcherDependencyProbe {
 export interface FetcherHttpRequest {
   readonly url: URL;
   readonly headers?: Readonly<Record<string, string>>;
+  readonly redirectPolicy?: Pick<FetcherDnsPolicy, "evaluate">;
   readonly userAgent: string;
   readonly connectTimeoutMs: number;
   readonly readTimeoutMs: number;
@@ -41,6 +42,9 @@ export interface FetcherHttpClient {
 
 export type FetcherDnsPolicyReason =
   | "allowed"
+  | "blocked-loopback-address"
+  | "blocked-link-local-address"
+  | "blocked-metadata-address"
   | "blocked-private-address"
   | "blocked-localhost"
   | "blocked-unsupported-protocol";
@@ -79,6 +83,32 @@ export type FetcherFetchStatus =
   | "transient_failure"
   | "permanent_failure";
 
+export type FetcherFailureClass =
+  | "dns"
+  | "connect"
+  | "tls"
+  | "timeout"
+  | "redirect"
+  | "http_status"
+  | "content_type"
+  | "oversize"
+  | "malformed_xml"
+  | "parser"
+  | "validation"
+  | "security"
+  | "unknown";
+
+export interface FetcherFailureDetails {
+  readonly failureClass: FetcherFailureClass;
+  readonly code: string;
+  readonly retryable: boolean;
+  readonly action: "retry" | "dlq";
+  readonly safeFeedUrl: string;
+  readonly diagnosticSample: string;
+  readonly httpStatus?: number;
+  readonly retryAfterMs?: number;
+}
+
 export interface FetcherFetchOutcome {
   readonly feedId: string;
   readonly feedUrl: string;
@@ -93,6 +123,7 @@ export interface FetcherFetchOutcome {
   readonly durationMs: number;
   readonly itemRefs?: readonly FetcherCandidateReference[];
   readonly diagnosticSample?: string;
+  readonly failure?: FetcherFailureDetails;
 }
 
 export interface FetcherCandidateReference {

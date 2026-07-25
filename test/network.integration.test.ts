@@ -8,6 +8,7 @@ import {
 } from "vitest";
 
 import {
+  DefaultFetcherDnsPolicy,
   FetcherHttpError,
   NodeFetcherHttpClient
 } from "../src/network.js";
@@ -87,6 +88,112 @@ describe("NodeFetcherHttpClient", () => {
     })).rejects.toMatchObject({
       name: "ResponseTooLargeError"
     } satisfies Partial<FetcherHttpError>);
+  });
+
+  it("fails slow response bodies with a read timeout", async () => {
+    activeServer = await listen((_request, response) => {
+      response.writeHead(200, {
+        "content-type": "application/rss+xml"
+      });
+      response.flushHeaders();
+      setTimeout(() => {
+        response.end("<rss><channel><title>late</title></channel></rss>");
+      }, 200);
+    });
+
+    const client = new NodeFetcherHttpClient();
+
+    await expect(client.request({
+      url: new URL(`${serverUrl(activeServer)}/feed.xml`),
+      userAgent: "test-fetcher",
+      connectTimeoutMs: 250,
+      readTimeoutMs: 25,
+      totalTimeoutMs: 5_000,
+      maxRedirects: 0,
+      maxResponseBytes: 1_024
+    })).rejects.toMatchObject({
+      name: "ReadTimeoutError"
+    } satisfies Partial<FetcherHttpError>);
+  });
+
+  it("does not follow redirects to blocked destinations", async () => {
+    let protectedHits = 0;
+    const protectedServer = await listen((_request, response) => {
+      protectedHits += 1;
+      response.writeHead(200, {
+        "content-type": "application/rss+xml"
+      });
+      response.end("<rss><channel><title>protected</title></channel></rss>");
+    });
+
+    try {
+      activeServer = await listen((_request, response) => {
+        response.writeHead(302, {
+          location: `${serverUrl(protectedServer)}/metadata.xml`
+        });
+        response.end();
+      });
+
+      const client = new NodeFetcherHttpClient();
+
+      await expect(client.request({
+        url: new URL(`${serverUrl(activeServer)}/feed.xml`),
+        redirectPolicy: {
+          evaluate: (url) => url.origin === serverUrl(protectedServer)
+            ? {
+                allowed: false,
+                reason: "blocked-loopback-address"
+              }
+            : {
+                allowed: true,
+                reason: "allowed"
+              }
+        },
+        userAgent: "test-fetcher",
+        connectTimeoutMs: 250,
+        readTimeoutMs: 1_000,
+        totalTimeoutMs: 5_000,
+        maxRedirects: 3,
+        maxResponseBytes: 1_024
+      })).rejects.toMatchObject({
+        name: "RedirectBlockedError"
+      } satisfies Partial<FetcherHttpError>);
+
+      expect(protectedHits).toBe(0);
+    } finally {
+      await closeServer(protectedServer);
+    }
+  });
+});
+
+describe("DefaultFetcherDnsPolicy", () => {
+  it("classifies protected literal destinations before DNS lookup", async () => {
+    const policy = new DefaultFetcherDnsPolicy();
+
+    await expect(policy.evaluate(new URL("ftp://feeds.example.test/feed.xml"))).resolves.toMatchObject({
+      allowed: false,
+      reason: "blocked-unsupported-protocol"
+    });
+    await expect(policy.evaluate(new URL("http://localhost/feed.xml"))).resolves.toMatchObject({
+      allowed: false,
+      reason: "blocked-localhost"
+    });
+    await expect(policy.evaluate(new URL("http://127.0.0.1/feed.xml"))).resolves.toMatchObject({
+      allowed: false,
+      reason: "blocked-loopback-address"
+    });
+    await expect(policy.evaluate(new URL("http://169.254.169.254/latest/meta-data"))).resolves.toMatchObject({
+      allowed: false,
+      reason: "blocked-metadata-address"
+    });
+    await expect(policy.evaluate(new URL("http://192.168.1.1/feed.xml"))).resolves.toMatchObject({
+      allowed: false,
+      reason: "blocked-private-address"
+    });
+    await expect(policy.evaluate(new URL("http://[fe80::1]/feed.xml"))).resolves.toMatchObject({
+      allowed: false,
+      reason: "blocked-link-local-address"
+    });
   });
 });
 
