@@ -5,7 +5,7 @@
 | Repository | `ramideltoro/nutsnews-worker-feed-fetcher` |
 | Owner | `@ramideltoro` |
 | Responsibility | Consume rss.feed.fetch jobs, download RSS/Atom feeds, normalize entries into article candidates, and publish rss.article.canonicalize messages. |
-| Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-feed-fetcher` after implementation work adds a Dockerfile. |
+| Deployable / package type | Deployable service repo. Publishes immutable SHA-tagged images to `ghcr.io/ramideltoro/nutsnews-worker-feed-fetcher`. |
 | Primary artifact | Signed GHCR image tagged only by commit SHA |
 | Support boundary | Repo-local code, tests, CI, package/image publishing, and service-local run notes. |
 | Outside boundary | Backend host runtime/deployments, Grafana Cloud resources, explanatory architecture/operations docs, production secrets, legacy ingestion. |
@@ -26,7 +26,7 @@
 - Default Actions token permission: read-only.
 - Publish workflows request package write permission only inside publish jobs.
 - CI validates repo boundary docs on every push and pull request.
-- CodeQL and dependency review workflows are present for future code-bearing changes.
+- CodeQL and dependency review workflows run against the code-bearing service shell.
 - Dependabot checks GitHub Actions and npm manifests.
 - Branch protection requires pull requests, resolved conversations, and the `validate` status check where GitHub permits repository branch protection. CODEOWNERS documents ownership for reviews.
 

@@ -11,6 +11,7 @@ on:
 permissions:
   actions: read
   contents: read
+  packages: read
   security-events: write
 
 jobs:
@@ -58,9 +59,24 @@ jobs:
         with:
           languages: ${{ matrix.language }}
 
-      - name: Autobuild
+      - name: Setup Node.js
         if: steps.source.outputs.has_code == 'true'
-        uses: github/codeql-action/autobuild@v4
+        uses: actions/setup-node@v7
+        with:
+          node-version: "24"
+          cache: "npm"
+          registry-url: "https://npm.pkg.github.com"
+          scope: "@ramideltoro"
+
+      - name: Install dependencies
+        if: steps.source.outputs.has_code == 'true'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npm ci
+
+      - name: Build
+        if: steps.source.outputs.has_code == 'true'
+        run: npm run build
 
       - name: Analyze
         if: steps.source.outputs.has_code == 'true'
