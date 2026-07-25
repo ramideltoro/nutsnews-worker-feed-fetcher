@@ -6,7 +6,7 @@ Deployable worker-uplift feed fetcher service shell for NutsNews.
 
 Own the fetcher service boundary that will consume contracted feed-fetch requests, safely download RSS/Atom feeds, and publish normalized feed-fetch results for canonicalization without touching legacy ingestion.
 
-Issue #95 bootstraps the deployable shell only. Conditional HTTP fetch, RSS/Atom parsing, durable fetch metadata, candidate fan-out, retry classification, and DLQ behavior are intentionally left to later pipeline issues.
+Issue #95 bootstraps the deployable shell. Issue #96 adds bounded conditional HTTP fetching, RSS/Atom parsing, idempotent fetch metadata, and contract-valid canonicalization candidate publication. Retry/DLQ hardening remains in the next pipeline issue.
 
 ## Owner
 
@@ -50,14 +50,24 @@ Important variables:
 - `NUTSNEWS_FETCHER_TOTAL_TIMEOUT_MS`
 - `NUTSNEWS_FETCHER_MAX_REDIRECTS`
 - `NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES`
+- `NUTSNEWS_FETCHER_ACCEPTED_CONTENT_TYPES`
 
 `NUTSNEWS_FETCHER_SHADOW_MODE` must remain `true` until backend-owned cutover work explicitly changes the deployment contract.
 
 ## Service Boundary
 
-The bootstrap service registers the contracted `fetch` consumer route and the future `canonicalization` publish route through the shared runtime broker lifecycle. The message processor validates worker envelopes and feed-fetch payloads, applies the durable idempotency interface, delegates work to an injected fetch handler, and drains in-flight deliveries during shutdown.
+The service registers the contracted `fetch` consumer route and `canonicalization` publish route through the shared runtime broker lifecycle. The message processor validates worker envelopes and feed-fetch payloads, applies the durable idempotency interface, delegates work to the fetch handler, and drains in-flight deliveries during shutdown.
 
-This issue adds only test interfaces and local doubles for:
+The fetch handler:
+
+- sends conditional `If-None-Match` and `If-Modified-Since` headers from durable fetch metadata;
+- enforces configured user agent, timeout, redirect, content-type, and response-size bounds;
+- parses RSS 2.x and Atom with namespace, CDATA, relative link, date, language, excerpt, and image-hint support;
+- records fetch outcomes without raw feed bodies;
+- publishes one contract-valid canonicalization message per new candidate identity;
+- skips fan-out for `304 Not Modified`, duplicate deliveries, and unchanged content fingerprints.
+
+The repository includes test interfaces and local doubles for:
 
 - broker transport;
 - HTTP client;
@@ -65,7 +75,7 @@ This issue adds only test interfaces and local doubles for:
 - durable state/idempotency;
 - fetch work handler.
 
-The repository does not yet fetch network content, parse feeds, persist metadata, or publish article candidates.
+The repository does not write production article rows, call AI providers, translate content, or publish user-facing articles.
 
 ## Development
 

@@ -22,6 +22,15 @@ describe("loadFetcherConfig", () => {
       concurrency: 8,
       prefetch: 16,
       shadowMode: true,
+      fetchPolicy: {
+        acceptedContentTypes: [
+          "application/rss+xml",
+          "application/atom+xml",
+          "application/xml",
+          "text/xml",
+          "text/rss+xml"
+        ]
+      },
       dependencies: {
         databaseConfigured: false,
         rabbitmqConfigured: false

@@ -1,4 +1,6 @@
 import type {
+  BrokerPublishCommand,
+  BrokerPublishReceipt,
   RuntimeBrokerTransport,
   RuntimeClock,
   RuntimeHandlerResult,
@@ -14,14 +16,21 @@ export interface FetcherDependencyProbe {
 export interface FetcherHttpRequest {
   readonly url: URL;
   readonly headers?: Readonly<Record<string, string>>;
-  readonly timeoutMs: number;
+  readonly userAgent: string;
+  readonly connectTimeoutMs: number;
+  readonly readTimeoutMs: number;
+  readonly totalTimeoutMs: number;
+  readonly maxRedirects: number;
   readonly maxResponseBytes: number;
 }
 
 export interface FetcherHttpResponse {
   readonly statusCode: number;
   readonly headers: Readonly<Record<string, string>>;
+  readonly body: Uint8Array;
   readonly bodyBytes: number;
+  readonly finalUrl: string;
+  readonly durationMs: number;
 }
 
 export interface FetcherHttpClient {
@@ -50,11 +59,85 @@ export interface FetcherDnsPolicy {
 export interface FetcherDurableStateStore extends RuntimeIdempotencyStore {
   readonly name: string;
   probe(): FetcherDependencyProbe | Promise<FetcherDependencyProbe>;
+  getFeedMetadata(feedId: string): Promise<FetcherFeedMetadata | undefined>;
+  recordFetchOutcome(outcome: FetcherFetchOutcome): Promise<void>;
+  claimCandidate(candidateId: string, claim: FetcherCandidateClaim): Promise<FetcherCandidateClaimResult>;
+  markCandidatePublished(candidateId: string, publication: FetcherCandidatePublication): Promise<void>;
+}
+
+export interface FetcherFeedMetadata {
+  readonly feedId: string;
+  readonly etag?: string;
+  readonly lastModified?: string;
+  readonly contentFingerprint?: string;
+  readonly fetchedAt?: string;
+}
+
+export type FetcherFetchStatus =
+  | "success"
+  | "unchanged"
+  | "transient_failure"
+  | "permanent_failure";
+
+export interface FetcherFetchOutcome {
+  readonly feedId: string;
+  readonly feedUrl: string;
+  readonly fetchedAt: string;
+  readonly fetchStatus: FetcherFetchStatus;
+  readonly httpStatus?: number;
+  readonly etag?: string;
+  readonly lastModified?: string;
+  readonly contentFingerprint?: string;
+  readonly bodyBytes: number;
+  readonly itemCount: number;
+  readonly durationMs: number;
+  readonly itemRefs?: readonly FetcherCandidateReference[];
+  readonly diagnosticSample?: string;
+}
+
+export interface FetcherCandidateReference {
+  readonly candidateId: string;
+  readonly sourceItemId: string;
+  readonly originalUrl: string;
+  readonly canonicalUrl: string;
+  readonly title: string;
+  readonly sourceName: string;
+  readonly publishedAt?: string;
+  readonly excerpt?: string;
+  readonly imageUrl?: string;
+  readonly language?: string;
+}
+
+export interface FetcherCandidateClaim {
+  readonly feedId: string;
+  readonly sourceItemId: string;
+  readonly contentFingerprint: string;
+  readonly firstSeenAt: string;
+}
+
+export type FetcherCandidateClaimResult =
+  | {
+      readonly status: "claimed";
+    }
+  | {
+      readonly status: "already-published";
+      readonly publishedAt: string;
+      readonly messageId: string;
+    };
+
+export interface FetcherCandidatePublication {
+  readonly publishedAt: string;
+  readonly messageId: string;
+  readonly idempotencyKey: string;
+}
+
+export interface FetcherWorkTools {
+  publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt>;
 }
 
 export interface FetcherWorkHandler {
   readonly name: string;
-  handle(context: RuntimeMessageContext): RuntimeHandlerResult | Promise<RuntimeHandlerResult>;
+  handle(context: RuntimeMessageContext, tools: FetcherWorkTools): RuntimeHandlerResult | Promise<RuntimeHandlerResult>;
 }
 
 export interface FetcherDependencies {

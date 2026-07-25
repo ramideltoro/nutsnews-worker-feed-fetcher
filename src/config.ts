@@ -32,7 +32,8 @@ export const FETCHER_CONFIG_SCHEMA = [
   variable("NUTSNEWS_FETCHER_READ_TIMEOUT_MS", "HTTP read timeout in milliseconds.", false, false, "10000"),
   variable("NUTSNEWS_FETCHER_TOTAL_TIMEOUT_MS", "Total feed fetch timeout in milliseconds.", false, false, "15000"),
   variable("NUTSNEWS_FETCHER_MAX_REDIRECTS", "Maximum safe redirects per feed fetch.", false, false, "3"),
-  variable("NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES", "Maximum feed response body size in bytes.", false, false, "1048576")
+  variable("NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES", "Maximum feed response body size in bytes.", false, false, "1048576"),
+  variable("NUTSNEWS_FETCHER_ACCEPTED_CONTENT_TYPES", "Comma-separated accepted feed response content types.", false, false, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/rss+xml")
 ] as const satisfies readonly FetcherConfigVariable[];
 
 export interface FetcherConfig {
@@ -62,6 +63,7 @@ export interface FetcherConfig {
     readonly totalTimeoutMs: number;
     readonly maxRedirects: number;
     readonly maxResponseBytes: number;
+    readonly acceptedContentTypes: readonly string[];
   };
 }
 
@@ -116,7 +118,8 @@ export function loadFetcherConfig(env: NodeJS.ProcessEnv = process.env): Fetcher
       readTimeoutMs,
       totalTimeoutMs,
       maxRedirects: parseInteger(env.NUTSNEWS_FETCHER_MAX_REDIRECTS, "NUTSNEWS_FETCHER_MAX_REDIRECTS", 3, 0, 10, issues),
-      maxResponseBytes: parseInteger(env.NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES, "NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES", 1_048_576, 1_024, 16_777_216, issues)
+      maxResponseBytes: parseInteger(env.NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES, "NUTSNEWS_FETCHER_MAX_RESPONSE_BYTES", 1_048_576, 1_024, 16_777_216, issues),
+      acceptedContentTypes: parseContentTypes(env.NUTSNEWS_FETCHER_ACCEPTED_CONTENT_TYPES, issues)
     }
   };
 
@@ -245,6 +248,22 @@ function parseInteger(
   }
 
   return parsed;
+}
+
+function parseContentTypes(value: string | undefined, issues: string[]): readonly string[] {
+  const contentTypes = nonEmpty(value, "application/rss+xml,application/atom+xml,application/xml,text/xml,text/rss+xml")
+    .split(",")
+    .map((entry) => entry.trim().toLowerCase())
+    .filter((entry) => entry.length > 0);
+
+  if (contentTypes.length === 0) {
+    issues.push("NUTSNEWS_FETCHER_ACCEPTED_CONTENT_TYPES must contain at least one content type.");
+    return [
+      "application/rss+xml"
+    ];
+  }
+
+  return contentTypes;
 }
 
 function requireConfigured(key: string, configured: boolean, issues: string[]): void {

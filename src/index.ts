@@ -6,6 +6,7 @@ import {
   createPrometheusRuntimeTelemetrySink,
   createRuntimeShutdownController,
   getRuntimePackageMetadata,
+  SYSTEM_RUNTIME_CLOCK,
   type RuntimeTelemetrySink
 } from "@ramideltoro/nutsnews-worker-runtime";
 
@@ -14,8 +15,16 @@ import {
   type FetcherConfig
 } from "./config.js";
 import { createFetcherHttpServer } from "./http.js";
+import { createFeedFetchWorkHandler } from "./ingestion.js";
+import {
+  DefaultFetcherDnsPolicy,
+  NodeFetcherHttpClient
+} from "./network.js";
 import { createFetcherService } from "./service.js";
-import { createLocalFetcherDependencies } from "./test-doubles.js";
+import {
+  InMemoryFetcherStateStore,
+  createLocalFetcherDependencies
+} from "./test-doubles.js";
 
 export {
   FETCHER_CONFIG_SCHEMA,
@@ -25,20 +34,51 @@ export {
   type FetcherConfig
 } from "./config.js";
 export type {
+  FetcherCandidateClaim,
+  FetcherCandidateClaimResult,
+  FetcherCandidatePublication,
+  FetcherCandidateReference,
   FetcherDependencies,
   FetcherDependencyProbe,
   FetcherDnsPolicy,
   FetcherDnsPolicyDecision,
   FetcherDurableStateStore,
+  FetcherFeedMetadata,
+  FetcherFetchOutcome,
+  FetcherFetchStatus,
   FetcherHttpClient,
   FetcherHttpRequest,
   FetcherHttpResponse,
+  FetcherWorkTools,
   FetcherWorkHandler
 } from "./dependencies.js";
 export {
   createFetcherHttpServer,
   type FetcherHttpServer
 } from "./http.js";
+export {
+  createFeedFetchWorkHandler,
+  type FeedFetchWorkHandlerOptions
+} from "./ingestion.js";
+export {
+  SequenceFetcherIdFactory,
+  createCryptoFetcherIdFactory,
+  sha256Base64Url,
+  sha256Hex,
+  stableCandidateId,
+  type FetcherIdFactory
+} from "./ids.js";
+export {
+  DefaultFetcherDnsPolicy,
+  FetcherHttpError,
+  NodeFetcherHttpClient
+} from "./network.js";
+export {
+  FeedParseError,
+  parseFeedXml,
+  type ParsedFeed,
+  type ParsedFeedItem
+} from "./feed-parser.js";
 export {
   createFetcherService,
   type FetcherService
@@ -83,7 +123,25 @@ export function createFetcherApplication(config = loadFetcherConfig()): FetcherA
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
-  const dependencies = createLocalFetcherDependencies();
+  const baseDependencies = createLocalFetcherDependencies({
+    clock: SYSTEM_RUNTIME_CLOCK,
+    httpClient: new NodeFetcherHttpClient(),
+    dnsPolicy: new DefaultFetcherDnsPolicy(),
+    stateStore: new InMemoryFetcherStateStore(SYSTEM_RUNTIME_CLOCK)
+  });
+  const dependencies = {
+    ...baseDependencies,
+    workHandler: createFeedFetchWorkHandler({
+      config,
+      dependencies: baseDependencies,
+      ...(telemetry === undefined ? {} : {
+        telemetry
+      }),
+      ...(metrics === undefined ? {} : {
+        metrics
+      })
+    })
+  };
   const service = createFetcherService({
     config,
     dependencies,

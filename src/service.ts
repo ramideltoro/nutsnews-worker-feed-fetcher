@@ -70,7 +70,9 @@ export function createFetcherService(options: FetcherServiceOptions): FetcherSer
       try {
         return await drain.track(async () => {
           options.metrics?.setInFlight(fetchRoute.mainQueue.name, drain.inFlight);
-          const result = await options.dependencies.workHandler.handle(context);
+          const result = await options.dependencies.workHandler.handle(context, {
+            publish: (command) => broker.publish(command)
+          });
 
           await emitRuntimeTelemetry(options.telemetry, {
             name: "runtime.dependency.observed",
