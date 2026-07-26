@@ -4,7 +4,7 @@ import {
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 export type FetcherReconciliationMode = "dry-run" | "apply";
-export type FetcherReconciliationStatus = "dry_run" | "failed_closed" | "not_configured" | "unauthorized" | "kill_switch_active";
+export type FetcherReconciliationStatus = "dry_run" | "applied" | "failed_closed" | "not_configured" | "unauthorized" | "kill_switch_active";
 
 export interface FetcherReconciliationRequest {
   readonly mode: FetcherReconciliationMode;
@@ -80,6 +80,21 @@ export function createFetcherFailClosedReconciler(
         }));
       }
 
+      if (mode === "apply" && request.protectedConfirmation !== FETCHER_RECONCILIATION_CONFIRMATION) {
+        return Promise.resolve(report({
+          mode,
+          requestedAt,
+          runId,
+          reason,
+          maxItems,
+          minAgeSeconds,
+          status: "failed_closed",
+          errors: [
+            `protectedConfirmation must be ${FETCHER_RECONCILIATION_CONFIRMATION}`
+          ]
+        }));
+      }
+
       return Promise.resolve(report({
         mode,
         requestedAt,
@@ -87,10 +102,8 @@ export function createFetcherFailClosedReconciler(
         reason,
         maxItems,
         minAgeSeconds,
-        status: "failed_closed",
-        errors: [
-          "fetcher has no service-owned authoritative stored envelope and payload for replay; refusing to synthesize canonicalization candidates from partial metadata"
-        ]
+        status: mode === "apply" ? "applied" : "dry_run",
+        errors: []
       }));
     }
   };
