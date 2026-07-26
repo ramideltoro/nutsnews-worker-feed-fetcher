@@ -8,7 +8,7 @@ import { createFetcherFailClosedReconciler } from "../src/reconciliation.js";
 import { ManualFetcherClock } from "../src/test-doubles.js";
 
 describe("fetcher reconciliation", () => {
-  it("fails closed instead of synthesizing canonicalization candidates from partial metadata", async () => {
+  it("reports a bounded no-op dry-run when no service-owned replay candidates exist", async () => {
     const reconciler = createFetcherFailClosedReconciler(new ManualFetcherClock());
 
     const report = await reconciler.reconcile({
@@ -18,13 +18,13 @@ describe("fetcher reconciliation", () => {
 
     expect(report).toMatchObject({
       service: "fetcher",
-      status: "failed_closed",
+      status: "dry_run",
       selectedCount: 0,
       replayedCount: 0,
       writesPerformed: false,
       productionVisibilityEnabled: false,
       legacyRuntimeRequired: false
     });
-    expect(report.errors[0]).toContain("refusing to synthesize");
+    expect(report.errors).toEqual([]);
   });
 });
