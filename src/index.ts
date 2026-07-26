@@ -20,6 +20,7 @@ import {
   DefaultFetcherDnsPolicy,
   NodeFetcherHttpClient
 } from "./network.js";
+import { PayloadRabbitMqTransport } from "./rabbitmq-transport.js";
 import { createFetcherService } from "./service.js";
 import {
   InMemoryFetcherStateStore,
@@ -84,6 +85,9 @@ export {
   type FetcherService
 } from "./service.js";
 export {
+  PayloadRabbitMqTransport
+} from "./rabbitmq-transport.js";
+export {
   InMemoryFetcherStateStore,
   LocalBrokerTransport,
   LocalDnsPolicy,
@@ -123,11 +127,21 @@ export function createFetcherApplication(config = loadFetcherConfig()): FetcherA
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
+  const productionBrokerTransport = config.dependencyMode === "production"
+    ? new PayloadRabbitMqTransport({
+        url: requiredEnv("NUTSNEWS_FETCHER_RABBITMQ_URL"),
+        prefetch: config.prefetch,
+        clock: SYSTEM_RUNTIME_CLOCK
+      })
+    : undefined;
   const baseDependencies = createLocalFetcherDependencies({
     clock: SYSTEM_RUNTIME_CLOCK,
     httpClient: new NodeFetcherHttpClient(),
     dnsPolicy: new DefaultFetcherDnsPolicy(),
-    stateStore: new InMemoryFetcherStateStore(SYSTEM_RUNTIME_CLOCK)
+    stateStore: new InMemoryFetcherStateStore(SYSTEM_RUNTIME_CLOCK),
+    ...(productionBrokerTransport === undefined ? {} : {
+      brokerTransport: productionBrokerTransport
+    })
   });
   const dependencies = {
     ...baseDependencies,
@@ -223,6 +237,16 @@ function assertPackageCompatibility(): void {
   if (runtimeVersion !== "0.4.0") {
     throw new Error(`Unsupported runtime package version ${runtimeVersion}.`);
   }
+}
+
+function requiredEnv(key: string): string {
+  const value = process.env[key]?.trim();
+
+  if (value === undefined || value.length === 0) {
+    throw new Error(`${key} is required for production fetcher dependencies.`);
+  }
+
+  return value;
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
