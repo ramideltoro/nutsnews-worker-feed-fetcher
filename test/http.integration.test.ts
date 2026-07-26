@@ -11,8 +11,14 @@ import {
   createFetcherHttpServer,
   type FetcherHttpServer
 } from "../src/http.js";
+import {
+  createFetcherFailClosedReconciler
+} from "../src/reconciliation.js";
 import { createFetcherService } from "../src/service.js";
-import { createLocalFetcherDependencies } from "../src/test-doubles.js";
+import {
+  ManualFetcherClock,
+  createLocalFetcherDependencies
+} from "../src/test-doubles.js";
 
 let activeServer: FetcherHttpServer | undefined;
 
@@ -66,6 +72,53 @@ describe("fetcher HTTP endpoints", () => {
 
     expect(schema.variables.some((variable) => variable.name === "NUTSNEWS_FETCHER_RABBITMQ_URL" && variable.sensitive)).toBe(true);
     expect(JSON.stringify(schema)).not.toContain("amqp://");
+
+    await service.stop();
+  });
+
+  it("protects the reconciliation endpoint with bearer auth", async () => {
+    const config = loadFetcherConfig({
+      NUTSNEWS_FETCHER_HTTP_HOST: "127.0.0.1",
+      NUTSNEWS_FETCHER_HTTP_PORT: "0",
+      NUTSNEWS_FETCHER_TELEMETRY_LOGS: "silent"
+    });
+    const service = createFetcherService({
+      config,
+      dependencies: createLocalFetcherDependencies()
+    });
+    activeServer = createFetcherHttpServer({
+      config,
+      service,
+      reconciler: createFetcherFailClosedReconciler(new ManualFetcherClock()),
+      reconciliationToken: "test-token"
+    });
+
+    await service.start();
+    await activeServer.listen();
+
+    const unauthorized = await fetch(activeServer.url("/reconcile/outbox"), {
+      method: "POST",
+      body: JSON.stringify({
+        mode: "dry-run"
+      })
+    });
+    expect(unauthorized.status).toBe(401);
+
+    const authorized = await fetch(activeServer.url("/reconcile/outbox"), {
+      method: "POST",
+      headers: {
+        authorization: "Bearer test-token"
+      },
+      body: JSON.stringify({
+        mode: "dry-run"
+      })
+    });
+    expect(authorized.status).toBe(409);
+    await expect(authorized.json()).resolves.toMatchObject({
+      status: "failed_closed",
+      writesPerformed: false,
+      productionVisibilityEnabled: false
+    });
 
     await service.stop();
   });
