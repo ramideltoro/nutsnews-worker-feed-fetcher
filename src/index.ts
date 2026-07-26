@@ -21,6 +21,9 @@ import {
   NodeFetcherHttpClient
 } from "./network.js";
 import { PayloadRabbitMqTransport } from "./rabbitmq-transport.js";
+import {
+  createFetcherFailClosedReconciler
+} from "./reconciliation.js";
 import { createFetcherService } from "./service.js";
 import {
   InMemoryFetcherStateStore,
@@ -88,6 +91,14 @@ export {
   PayloadRabbitMqTransport
 } from "./rabbitmq-transport.js";
 export {
+  FETCHER_RECONCILIATION_CONFIRMATION,
+  FETCHER_RECONCILIATION_PATH,
+  createFetcherFailClosedReconciler,
+  type FetcherReconciliationReport,
+  type FetcherReconciliationRequest,
+  type FetcherReconciler
+} from "./reconciliation.js";
+export {
   InMemoryFetcherStateStore,
   LocalBrokerTransport,
   LocalDnsPolicy,
@@ -127,6 +138,7 @@ export function createFetcherApplication(config = loadFetcherConfig()): FetcherA
       })
     : undefined;
   const telemetry = combineTelemetrySinks(logSink, metrics);
+  const reconciliationToken = reconciliationTokenFromEnv();
   const productionBrokerTransport = config.dependencyMode === "production"
     ? new PayloadRabbitMqTransport({
         url: requiredEnv("NUTSNEWS_FETCHER_RABBITMQ_URL"),
@@ -169,6 +181,10 @@ export function createFetcherApplication(config = loadFetcherConfig()): FetcherA
   const httpServer = createFetcherHttpServer({
     config,
     service,
+    reconciler: createFetcherFailClosedReconciler(SYSTEM_RUNTIME_CLOCK),
+    ...(reconciliationToken === undefined ? {} : {
+      reconciliationToken
+    }),
     ...(metrics === undefined ? {} : {
       metrics
     })
@@ -204,6 +220,14 @@ export function createFetcherApplication(config = loadFetcherConfig()): FetcherA
       await shutdown.trigger("manual");
     }
   };
+}
+
+function reconciliationTokenFromEnv(): string | undefined {
+  const serviceToken = process.env.NUTSNEWS_FETCHER_RECONCILIATION_TOKEN?.trim();
+  const globalToken = process.env.NUTSNEWS_WORKER_UPLIFT_RECONCILIATION_TOKEN?.trim();
+  const token = serviceToken !== undefined && serviceToken.length > 0 ? serviceToken : globalToken;
+
+  return token === undefined || token.length === 0 ? undefined : token;
 }
 
 function combineTelemetrySinks(
