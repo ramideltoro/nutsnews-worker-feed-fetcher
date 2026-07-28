@@ -29,9 +29,11 @@ The image runs as a non-root user, exposes port `8080`, and serves:
 The service consumes exact immutable worker-uplift package versions:
 
 - `@ramideltoro/nutsnews-worker-contracts@0.3.1`
-- `@ramideltoro/nutsnews-worker-runtime@0.4.0`
+- `@ramideltoro/nutsnews-worker-runtime@0.5.0`
 
 Local and CI installs use the owner-scoped GitHub Packages npm registry. No package token value is committed.
+
+`/ready` is unhealthy whenever the `fetch` main queue has zero active consumers. Consumer cancellation and channel-drop recovery emit bounded structured runtime events and Prometheus consumer-state metrics.
 
 ## Configuration
 

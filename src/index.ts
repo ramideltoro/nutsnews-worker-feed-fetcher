@@ -143,7 +143,10 @@ export function createFetcherApplication(config = loadFetcherConfig()): FetcherA
     ? new PayloadRabbitMqTransport({
         url: requiredEnv("NUTSNEWS_FETCHER_RABBITMQ_URL"),
         prefetch: config.prefetch,
-        clock: SYSTEM_RUNTIME_CLOCK
+        clock: SYSTEM_RUNTIME_CLOCK,
+        ...(telemetry === undefined ? {} : {
+          telemetry
+        })
       })
     : undefined;
   const baseDependencies = createLocalFetcherDependencies({

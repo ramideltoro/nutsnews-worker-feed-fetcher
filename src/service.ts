@@ -3,6 +3,7 @@ import {
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createBrokerLifecycle,
+  createBrokerConsumerReadinessCheck,
   createRuntimeHealthProbeSet,
   createRuntimeInFlightDrainController,
   createRuntimeMessageProcessor,
@@ -112,6 +113,7 @@ export function createFetcherService(options: FetcherServiceOptions): FetcherSer
         ],
         readinessChecks: [
           brokerReadinessCheck(broker),
+          createBrokerConsumerReadinessCheck(broker, "fetch"),
           dependencyReadinessCheck("http-client", options.dependencies.httpClient),
           dependencyReadinessCheck("dns-policy", options.dependencies.dnsPolicy),
           dependencyReadinessCheck("durable-state", options.dependencies.stateStore),
