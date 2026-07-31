@@ -16,6 +16,7 @@ export interface FetcherDependencyProbe {
 export interface FetcherHttpRequest {
   readonly url: URL;
   readonly headers?: Readonly<Record<string, string>>;
+  readonly initialDnsDecision?: FetcherDnsPolicyDecision;
   readonly redirectPolicy?: Pick<FetcherDnsPolicy, "evaluate">;
   readonly userAgent: string;
   readonly connectTimeoutMs: number;
@@ -52,6 +53,12 @@ export type FetcherDnsPolicyReason =
 export interface FetcherDnsPolicyDecision {
   readonly allowed: boolean;
   readonly reason: FetcherDnsPolicyReason;
+  readonly resolvedAddresses?: readonly FetcherResolvedAddress[];
+}
+
+export interface FetcherResolvedAddress {
+  readonly address: string;
+  readonly family: 4 | 6;
 }
 
 export interface FetcherDnsPolicy {

@@ -1,5 +1,11 @@
 import dns from "node:dns/promises";
 import net from "node:net";
+import type { LookupFunction } from "node:net";
+
+import {
+  Agent,
+  fetch
+} from "undici";
 
 import type {
   FetcherDependencyProbe,
@@ -8,7 +14,8 @@ import type {
   FetcherDnsPolicyReason,
   FetcherHttpClient,
   FetcherHttpRequest,
-  FetcherHttpResponse
+  FetcherHttpResponse,
+  FetcherResolvedAddress
 } from "./dependencies.js";
 
 export class FetcherHttpError extends Error {
@@ -39,6 +46,7 @@ export class NodeFetcherHttpClient implements FetcherHttpClient {
     const startedAt = Date.now();
     const deadlineAt = startedAt + request.totalTimeoutMs;
     let currentUrl = request.url;
+    let currentDnsDecision = request.initialDnsDecision;
     let redirectCount = 0;
 
     for (;;) {
@@ -48,6 +56,10 @@ export class NodeFetcherHttpClient implements FetcherHttpClient {
         throw new FetcherHttpError("TotalTimeoutError", "Feed fetch total timeout exceeded.");
       }
 
+      const dnsDecision = await decisionForRequest(request, currentUrl, currentDnsDecision);
+      const dispatcher = dnsDecision === undefined
+        ? undefined
+        : createPinnedDispatcher(dnsDecision, request.connectTimeoutMs);
       const controller = new AbortController();
       let abortReason = "TotalTimeoutError";
       const totalTimeout = setTimeout(() => {
@@ -58,9 +70,11 @@ export class NodeFetcherHttpClient implements FetcherHttpClient {
         abortReason = "ConnectTimeoutError";
         controller.abort();
       }, Math.min(request.connectTimeoutMs, remainingTotalTimeoutMs));
-
       try {
         const response = await fetch(currentUrl, {
+          ...(dispatcher === undefined ? {} : {
+            dispatcher
+          }),
           headers: {
             "accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, text/rss+xml;q=0.9, */*;q=0.1",
             "user-agent": request.userAgent,
@@ -86,7 +100,8 @@ export class NodeFetcherHttpClient implements FetcherHttpClient {
           }
 
           const nextUrl = new URL(location, currentUrl);
-          await assertRedirectAllowed(request, nextUrl);
+          currentDnsDecision = await redirectDecision(request, nextUrl);
+          await response.body?.cancel("redirect-policy-evaluated");
           currentUrl = nextUrl;
           redirectCount += 1;
           continue;
@@ -113,6 +128,7 @@ export class NodeFetcherHttpClient implements FetcherHttpClient {
       } finally {
         clearTimeout(connectTimeout);
         clearTimeout(totalTimeout);
+        await dispatcher?.close();
       }
     }
   }
@@ -177,7 +193,11 @@ export class DefaultFetcherDnsPolicy implements FetcherDnsPolicy {
 
     return {
       allowed: true,
-      reason: "allowed"
+      reason: "allowed",
+      resolvedAddresses: addresses.map((address) => ({
+        address: address.address,
+        family: address.family === 6 ? 6 : 4
+      }))
     };
   }
 }
@@ -186,9 +206,31 @@ function isRedirect(statusCode: number): boolean {
   return statusCode === 301 || statusCode === 302 || statusCode === 303 || statusCode === 307 || statusCode === 308;
 }
 
-async function assertRedirectAllowed(request: FetcherHttpRequest, nextUrl: URL): Promise<void> {
+async function decisionForRequest(
+  request: FetcherHttpRequest,
+  currentUrl: URL,
+  currentDecision: FetcherDnsPolicyDecision | undefined
+): Promise<FetcherDnsPolicyDecision | undefined> {
+  if (currentDecision !== undefined) {
+    assertAllowedDecision(currentDecision);
+    return currentDecision;
+  }
+
   if (request.redirectPolicy === undefined) {
-    return;
+    return undefined;
+  }
+
+  const decision = await request.redirectPolicy.evaluate(currentUrl);
+  assertAllowedDecision(decision);
+  return decision;
+}
+
+async function redirectDecision(
+  request: FetcherHttpRequest,
+  nextUrl: URL
+): Promise<FetcherDnsPolicyDecision | undefined> {
+  if (request.redirectPolicy === undefined) {
+    return undefined;
   }
 
   const decision = await request.redirectPolicy.evaluate(nextUrl);
@@ -198,6 +240,77 @@ async function assertRedirectAllowed(request: FetcherHttpRequest, nextUrl: URL):
       policyReason: decision.reason
     });
   }
+
+  assertAllowedDecision(decision);
+  return decision;
+}
+
+function assertAllowedDecision(decision: FetcherDnsPolicyDecision): void {
+  if (!decision.allowed) {
+    throw new FetcherHttpError("DnsPolicyBlockedError", "Feed target failed network policy.", {
+      policyReason: decision.reason
+    });
+  }
+
+  if (decision.resolvedAddresses === undefined || decision.resolvedAddresses.length === 0) {
+    throw new FetcherHttpError("DnsBindingError", "Allowed DNS policy decision did not include a validated address set.");
+  }
+
+  for (const resolved of decision.resolvedAddresses) {
+    if (net.isIP(resolved.address) !== resolved.family) {
+      throw new FetcherHttpError("DnsBindingError", "Allowed DNS policy decision included an invalid address family.");
+    }
+  }
+}
+
+function createPinnedDispatcher(decision: FetcherDnsPolicyDecision, connectTimeoutMs: number): Agent {
+  const addresses = decision.resolvedAddresses;
+
+  if (addresses === undefined || addresses.length === 0) {
+    throw new FetcherHttpError("DnsBindingError", "Allowed DNS policy decision did not include a validated address set.");
+  }
+
+  return new Agent({
+    connectTimeout: connectTimeoutMs,
+    connect: {
+      lookup: pinnedLookup(addresses)
+    }
+  });
+}
+
+function pinnedLookup(addresses: readonly FetcherResolvedAddress[]): LookupFunction {
+  return (_hostname, options, callback) => {
+    const family = options.family;
+    const candidates = family === 4 || family === 6
+      ? addresses.filter((address) => address.family === family)
+      : addresses;
+
+    if (candidates.length === 0) {
+      const error = new Error("Validated DNS address set has no address for the requested family.") as NodeJS.ErrnoException;
+      error.code = "ENOTFOUND";
+      callback(error, "", 0);
+      return;
+    }
+
+    if (options.all === true) {
+      callback(null, candidates.map((address) => ({
+        address: address.address,
+        family: address.family
+      })));
+      return;
+    }
+
+    const selected = candidates[0];
+
+    if (selected === undefined) {
+      const error = new Error("Validated DNS address set was empty.") as NodeJS.ErrnoException;
+      error.code = "ENOTFOUND";
+      callback(error, "", 0);
+      return;
+    }
+
+    callback(null, selected.address, selected.family);
+  };
 }
 
 async function readResponseBody(response: Response, maxBytes: number, readTimeoutMs: number): Promise<Uint8Array> {
