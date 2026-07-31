@@ -146,7 +146,11 @@ describe("NodeFetcherHttpClient", () => {
               }
             : {
                 allowed: true,
-                reason: "allowed"
+                reason: "allowed",
+                resolvedAddresses: [{
+                  address: "127.0.0.1",
+                  family: 4
+                }]
               }
         },
         userAgent: "test-fetcher",
@@ -163,6 +167,74 @@ describe("NodeFetcherHttpClient", () => {
     } finally {
       await closeServer(protectedServer);
     }
+  });
+
+  it("connects to the exact address validated by policy without resolving the hostname again", async () => {
+    activeServer = await listen((_request, response) => {
+      response.writeHead(200, {
+        "content-type": "application/rss+xml"
+      });
+      response.end("<rss><channel><title>pinned</title></channel></rss>");
+    });
+
+    const address = activeServer.address();
+
+    if (!isAddressInfo(address)) {
+      throw new Error("server is not listening on a TCP address");
+    }
+
+    const client = new NodeFetcherHttpClient();
+    const response = await client.request({
+      url: new URL(`http://rebinding.invalid:${String(address.port)}/feed.xml`),
+      initialDnsDecision: {
+        allowed: true,
+        reason: "allowed",
+        resolvedAddresses: [{
+          address: "127.0.0.1",
+          family: 4
+        }]
+      },
+      userAgent: "test-fetcher",
+      connectTimeoutMs: 250,
+      readTimeoutMs: 1_000,
+      totalTimeoutMs: 5_000,
+      maxRedirects: 0,
+      maxResponseBytes: 1_024
+    });
+
+    expect(response).toMatchObject({
+      statusCode: 200,
+      finalUrl: `http://rebinding.invalid:${String(address.port)}/feed.xml`
+    });
+  });
+
+  it("fails closed before connect when an allowed policy decision has no validated addresses", async () => {
+    let hits = 0;
+    activeServer = await listen((_request, response) => {
+      hits += 1;
+      response.writeHead(200);
+      response.end("unexpected");
+    });
+
+    const client = new NodeFetcherHttpClient();
+
+    await expect(client.request({
+      url: new URL(`${serverUrl(activeServer)}/feed.xml`),
+      initialDnsDecision: {
+        allowed: true,
+        reason: "allowed"
+      },
+      userAgent: "test-fetcher",
+      connectTimeoutMs: 250,
+      readTimeoutMs: 1_000,
+      totalTimeoutMs: 5_000,
+      maxRedirects: 0,
+      maxResponseBytes: 1_024
+    })).rejects.toMatchObject({
+      name: "DnsBindingError"
+    } satisfies Partial<FetcherHttpError>);
+
+    expect(hits).toBe(0);
   });
 });
 

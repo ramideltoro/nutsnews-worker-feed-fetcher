@@ -129,6 +129,7 @@ async function handleFeedFetch(
       totalTimeoutMs: request.timeoutMs,
       maxRedirects: options.config.fetchPolicy.maxRedirects,
       maxResponseBytes: options.config.fetchPolicy.maxResponseBytes,
+      initialDnsDecision: dnsDecision,
       redirectPolicy: options.dependencies.dnsPolicy
     });
 
