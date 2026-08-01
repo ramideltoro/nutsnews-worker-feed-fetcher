@@ -15,6 +15,22 @@ jobs:
     name: validate
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_DB: fetcher_test
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_USER: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d fetcher_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+    env:
+      FETCHER_INTEGRATION_POSTGRES_URL: postgres://postgres:postgres@localhost:5432/fetcher_test
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1

@@ -35,6 +35,10 @@ Local and CI installs use the owner-scoped GitHub Packages npm registry. No pack
 
 `/ready` is unhealthy whenever the `fetch` main queue has zero active consumers. Consumer cancellation and channel-drop recovery emit bounded structured runtime events and Prometheus consumer-state metrics.
 
+Production state is deliberately fail-closed and durable. In `production` dependency mode the application constructs the PostgreSQL adapter only from the protected runtime URL, probes backend-owned state contract version 1, and does not register the RabbitMQ consumer unless that contract and every required table are healthy. The HTTP client, DNS policy, RabbitMQ transport, and state store must each identify as a production adapter; any test/unknown mixture exports `adapter="mixed"` and keeps readiness unhealthy and consumption disabled. Missing adapter configuration selects an explicit `unsupported` store. Local `test` mode uses the explicitly ephemeral `local-memory` adapter only.
+
+The diagnostic HTTP server binds before state-store probing or broker startup. State-store startup probing is bounded by `NUTSNEWS_FETCHER_STARTUP_TIMEOUT_MS`; an unhealthy, failed, or timed-out probe keeps consumption disabled and readiness unhealthy while liveness, startup, and metrics remain queryable.
+
 ## Configuration
 
 The value-free configuration schema lives in `src/config.ts` and is exposed at `/config-schema`. Production deployments must provide dependency values through backend-owned deployment configuration, not this repository.
@@ -43,10 +47,16 @@ Important variables:
 
 - `NUTSNEWS_FETCHER_DEPENDENCY_MODE`: `test` or `production`
 - `NUTSNEWS_FETCHER_DATABASE_URL`
+- `NUTSNEWS_FETCHER_DATABASE_POOL_MAX`
+- `NUTSNEWS_FETCHER_DATABASE_TIMEOUT_MS`
+- `NUTSNEWS_FETCHER_IDEMPOTENCY_LEASE_MS`
 - `NUTSNEWS_FETCHER_RABBITMQ_URL`
 - `NUTSNEWS_FETCHER_CONCURRENCY`
 - `NUTSNEWS_FETCHER_PREFETCH`
+- `NUTSNEWS_FETCHER_STARTUP_TIMEOUT_MS`
+- `NUTSNEWS_FETCHER_SHUTDOWN_TIMEOUT_MS`
 - `NUTSNEWS_FETCHER_SHADOW_MODE`
+- `NUTSNEWS_FETCHER_BUILD_REVISION`
 - `NUTSNEWS_FETCHER_CONNECT_TIMEOUT_MS`
 - `NUTSNEWS_FETCHER_READ_TIMEOUT_MS`
 - `NUTSNEWS_FETCHER_TOTAL_TIMEOUT_MS`
@@ -56,6 +66,31 @@ Important variables:
 - `NUTSNEWS_FETCHER_ACCEPTED_CONTENT_TYPES`
 
 `NUTSNEWS_FETCHER_SHADOW_MODE` must remain `true` until backend-owned cutover work explicitly changes the deployment contract.
+
+The default prefetch equals concurrency so a single maximum-duration HTTP request wave fits inside the graceful shutdown budget with time left for state and broker settlement. Intake cancellation begins before the HTTP server waits for active diagnostics, and a forced shutdown rejects queued work rather than starting it after the deadline. AMQP topology is asserted at startup and after reconnect; concurrent reconnect/publish paths share one channel-open operation so they cannot leave duplicate consumers behind.
+
+`expected_active=0` describes production ownership and gates paging while the worker is shadowed; it is not a readiness failure. Production-shadow readiness is healthy when the PostgreSQL state contract, HTTP/DNS dependencies, RabbitMQ lifecycle, and active consumer are usable.
+
+The metrics endpoint exports bounded service identity and operating-state signals:
+
+- `nutsnews_worker_build_info`
+- `nutsnews_worker_deployment_info`
+- `nutsnews_worker_expected_active`
+- `nutsnews_worker_state_store_ready`
+- `nutsnews_worker_last_success_timestamp_seconds`
+- `nutsnews_worker_health_probe`
+- `nutsnews_worker_metrics_enabled`
+- `nutsnews_worker_telemetry_collection_ready`
+- `nutsnews_worker_processing_duration_seconds`
+- `nutsnews_worker_dependency_duration_seconds`
+- `nutsnews_worker_uplift_stage_events_total`
+- `nutsnews_worker_uplift_stage_latency_seconds`
+
+State-store readiness details and structured startup health telemetry include the expected/actual store mode, all four dependency adapter modes, their aggregate mode, dependency/deployment mode, service version, build revision, and `expectedActive`. Distinct liveness, startup, and readiness series exist with explicit pre-start values and transition with service startup, every metrics scrape, consumer cancellation, and shutdown. A disabled or failed collector returns explicit bounded `metrics_enabled=0` or `telemetry_collection_ready=0` state instead of an empty scrape. Secrets and per-feed/message identifiers are not metric labels.
+
+Each completed fetch delivery contributes exactly one bounded lifecycle outcome: `success`, `duplicate`, `invalid`, `retry`, or `dlq`. Successful and duplicate terminal completions both advance the monotonic last-success timestamp and form the success numerator. Measured completion latency is exported in seconds with cumulative `0.01`, `0.05`, `0.1`, `0.25`, `0.5`, `1`, `2.5`, `5`, `10`, `30`, `60`, `120`, and `300` second buckets, followed by `+Inf`, `_sum`, and `_count`. The canonical stage families use only `environment`, `service="fetch"`, `outcome`, and the fixed histogram `le` boundary; delivery identifiers remain structured-log metadata only.
+
+Every configured log, telemetry, and metric sink is independently best effort before it reaches the broker, processor, ingestion handler, health probes, or shutdown controller. Sink rejection cannot change acknowledgement, idempotency, retry, or DLQ decisions, and a failed sink cannot prevent another sink from observing the same event. Dependency latency is observed exclusively through duration-bearing `runtime.dependency.observed` events; no direct mutation proxy remains, and startup or other duration-less observations do not create zero-millisecond samples. Health events remain in structured logs but are consumed locally rather than forwarded to the shared metrics sink, keeping exactly one seeded health family across Runtime 0.5 and 1.0.
 
 ## Service Boundary
 
@@ -74,6 +109,8 @@ The fetch handler:
 - publishes one contract-valid canonicalization message per new candidate identity;
 - skips fan-out for `304 Not Modified`, duplicate deliveries, and unchanged content fingerprints.
 
+Successful fetch metadata, including the content fingerprint used for unchanged detection, is committed only after every newly claimed candidate has a confirmed publication and a recorded publication marker. If a partial fan-out fails, the delivery is retried: already published candidate IDs are skipped and the remaining candidates are published before the feed fingerprint advances. Unexpected processor exceptions are transferred with publisher confirmation to the contracted retry tier or terminal DLQ before the original delivery is acknowledged, with exactly one bounded retry/DLQ lifecycle event for the disposition.
+
 The repository includes test interfaces and local doubles for:
 
 - broker transport;
@@ -81,6 +118,12 @@ The repository includes test interfaces and local doubles for:
 - DNS policy;
 - durable state/idempotency;
 - fetch work handler.
+
+The PostgreSQL adapter uses the reviewed backend-owned `worker_uplift_fetcher` schema for leased inbox claims, fetch-version metadata, append-only outcome history, feed-health projections, and durable canonicalization outbox commands. Fetch outcomes receive an explicit 30-day `redact_after` boundary and cleanup index. Inbox and outbox ownership use bounded crash-recovery leases. A publish failure moves the outbox record to `retrying`; the next owner republishes the original stored command and stable message/idempotency identity before confirming it. The protected reconciliation endpoint can dry-run pending commands or apply a bounded replay with explicit confirmation and the global/service kill switch.
+
+The service never creates or migrates production schema. `migrations/001_worker_uplift_fetcher_state.sql` is the integration-test/reference contract; `ramideltoro/nutsnews-backend` owns the additive production migration, database role, grants, and secret injection. CI runs the state adapter against PostgreSQL and covers contract probing, lease reclamation with distinct owners, metadata/outcome persistence, stored-command replay, and confirmation.
+
+Production ownership remains blocked. Runtime 0.5 uses the RabbitMQ message ID as the inbox owner, so a redelivery of the same message after lease expiry does not provide a distinct claim token that can fence an older execution. Runtime 1 claim-token/CAS migration is required before cutover, together with ambiguous claim/completion conformance and a production lease no longer than five minutes; the current shadow default remains 30 minutes. Reconciliation selection also needs an atomic replay claim before concurrent apply requests are permitted; the current endpoint remains a protected shadow-recovery tool and must be serialized by the operator.
 
 The repository does not write production article rows, call AI providers, translate content, or publish user-facing articles.
 

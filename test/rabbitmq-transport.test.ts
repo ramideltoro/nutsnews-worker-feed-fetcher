@@ -10,9 +10,18 @@ import {
   it,
   vi
 } from "vitest";
-import { createBufferedRuntimeTelemetrySink } from "@ramideltoro/nutsnews-worker-runtime";
+import {
+  createBufferedRuntimeTelemetrySink,
+  type RuntimeMessageProcessingResult
+} from "@ramideltoro/nutsnews-worker-runtime";
+import { getWorkerRoute } from "@ramideltoro/nutsnews-worker-contracts";
 
 import { PayloadRabbitMqTransport } from "../src/rabbitmq-transport.js";
+import {
+  createMinimalCanonicalizationCommand,
+  createMinimalFetchDelivery,
+  createMinimalFetchEnvelope
+} from "../src/test-doubles.js";
 
 type CloseHandler = () => void;
 
@@ -21,15 +30,41 @@ interface FakeBroker {
   readonly connect: (url: string) => Promise<ChannelModel>;
 }
 
+interface FakeBrokerOptions {
+  readonly assertQueue?: (queue: string) => Promise<void>;
+  readonly cancel?: (consumerTag: string) => Promise<void>;
+}
+
 interface FakeConnection {
   readonly channel: FakeChannel;
+  readonly closeCalls: string[];
   emitClose(): void;
   toChannelModel(): ChannelModel;
 }
 
 interface FakeChannel {
+  readonly assertedExchanges: string[];
+  readonly assertedQueues: string[];
+  readonly bindings: {
+    readonly queue: string;
+    readonly exchange: string;
+    readonly routingKey: string;
+  }[];
+  readonly cancelCalls: string[];
+  readonly closeCalls: string[];
   readonly consumeQueues: string[];
   readonly prefetchCalls: number[];
+  readonly publishes: {
+    readonly exchange: string;
+    readonly routingKey: string;
+    readonly content: Buffer;
+  }[];
+  readonly acknowledgements: ConsumeMessage[];
+  readonly negativeAcknowledgements: {
+    readonly message: ConsumeMessage;
+    readonly requeue: boolean | undefined;
+  }[];
+  deliver(queue: string, carrier: unknown): ConsumeMessage;
   toConfirmChannel(): ConfirmChannel;
 }
 
@@ -54,6 +89,9 @@ describe("RabbitMQ payload transport", () => {
       telemetry
     });
 
+    await transport.assertTopology([
+      getWorkerRoute("fetch")
+    ]);
     await transport.consume("fetch", () => Promise.resolve({
       action: "dlq",
       reason: "not-used"
@@ -83,6 +121,7 @@ describe("RabbitMQ payload transport", () => {
     expect(broker.connections[1]?.channel.prefetchCalls).toEqual([
       4
     ]);
+    expect(broker.connections[1]?.channel.assertedQueues).toContain("nutsnews.worker.fetch.v1");
     expect(transport.consumerStatus("fetch")).toMatchObject({
       state: "active",
       activeConsumers: 1
@@ -90,30 +129,312 @@ describe("RabbitMQ payload transport", () => {
 
     await transport.close();
   });
+
+  it("coalesces concurrent reconnect paths and restores one tracked consumer", async () => {
+    const broker = createFakeBroker();
+    const transport = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: broker.connect
+    });
+
+    await transport.assertTopology([
+      getWorkerRoute("fetch"),
+      getWorkerRoute("canonicalization")
+    ]);
+    await transport.consume("fetch", () => Promise.resolve({
+      action: "dlq",
+      reason: "not-used"
+    }));
+    broker.connections[0]?.emitClose();
+
+    await Promise.all([
+      transport.publish(createMinimalCanonicalizationCommand()),
+      transport.publish(createMinimalCanonicalizationCommand({
+        candidateId: "candidate-world-two",
+        messageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3632",
+        idempotencyKey: "fetcher:canonicalization:candidate-world-two:fingerprint-v1"
+      }))
+    ]);
+
+    expect(broker.connections).toHaveLength(2);
+    expect(broker.connections[1]?.channel.consumeQueues).toEqual([
+      "nutsnews.worker.fetch.v1"
+    ]);
+    expect(broker.connections[1]?.channel.publishes).toHaveLength(2);
+    expect(transport.consumerStatus("fetch")).toMatchObject({
+      state: "active",
+      activeConsumers: 1
+    });
+
+    await transport.close();
+  });
+
+  it("asserts exchanges, queues, and bindings for input and output routes", async () => {
+    const broker = createFakeBroker();
+    const transport = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: broker.connect
+    });
+    const fetchRoute = getWorkerRoute("fetch");
+    const canonicalizationRoute = getWorkerRoute("canonicalization");
+
+    await transport.assertTopology([
+      fetchRoute,
+      canonicalizationRoute
+    ]);
+
+    const channel = broker.connections[0]?.channel;
+
+    expect(channel?.assertedExchanges).toEqual([
+      fetchRoute.exchange,
+      fetchRoute.retryExchange,
+      fetchRoute.dlqExchange
+    ]);
+    expect(channel?.assertedQueues).toEqual(expect.arrayContaining([
+      fetchRoute.mainQueue.name,
+      ...fetchRoute.retryQueues.map((queue) => queue.name),
+      fetchRoute.terminalDlq.name,
+      canonicalizationRoute.mainQueue.name,
+      ...canonicalizationRoute.retryQueues.map((queue) => queue.name),
+      canonicalizationRoute.terminalDlq.name
+    ]));
+    expect(channel?.bindings).toContainEqual({
+      queue: canonicalizationRoute.mainQueue.name,
+      exchange: canonicalizationRoute.exchange,
+      routingKey: canonicalizationRoute.routingKey
+    });
+
+    await transport.close();
+  });
+
+  it("does not publish through a channel before topology initialization completes", async () => {
+    let releaseTopology!: () => void;
+    let markTopologyEntered!: () => void;
+    const topologyGate = new Promise<void>((resolve) => {
+      releaseTopology = resolve;
+    });
+    const topologyEntered = new Promise<void>((resolve) => {
+      markTopologyEntered = resolve;
+    });
+    const broker = createFakeBroker({
+      assertQueue: async () => {
+        markTopologyEntered();
+        await topologyGate;
+      }
+    });
+    const transport = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: broker.connect
+    });
+    const topology = transport.assertTopology([
+      getWorkerRoute("canonicalization")
+    ]);
+
+    await topologyEntered;
+    const publication = transport.publish(createMinimalCanonicalizationCommand());
+
+    await Promise.resolve();
+    expect(broker.connections[0]?.channel.publishes).toHaveLength(0);
+
+    releaseTopology();
+    await Promise.all([
+      topology,
+      publication
+    ]);
+    expect(broker.connections[0]?.channel.publishes).toHaveLength(1);
+
+    await transport.close();
+  });
+
+  it("starts socket teardown even when consumer cancellation never settles", async () => {
+    const broker = createFakeBroker({
+      cancel: () => new Promise<void>(() => undefined)
+    });
+    const transport = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: broker.connect
+    });
+
+    const envelope = createMinimalFetchEnvelope();
+
+    await transport.consume("fetch", () => Promise.resolve({
+      action: "ack",
+      reason: "handled",
+      envelope
+    }));
+    await expect(transport.close()).resolves.toBeUndefined();
+
+    const connection = broker.connections[0];
+
+    expect(connection?.channel.cancelCalls).toEqual([
+      "consumer-1"
+    ]);
+    expect(connection?.channel.closeCalls).toEqual([
+      "close"
+    ]);
+    expect(connection?.closeCalls).toEqual([
+      "close"
+    ]);
+  });
+
+  it("clears the drain deadline after in-flight delivery settles", async () => {
+    vi.useFakeTimers();
+    const broker = createFakeBroker();
+    const transport = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: broker.connect
+    });
+    let settle: ((result: RuntimeMessageProcessingResult) => void) | undefined;
+    const handled = new Promise<RuntimeMessageProcessingResult>((resolve) => {
+      settle = resolve;
+    });
+    const delivery = createMinimalFetchDelivery();
+    const envelope = createMinimalFetchEnvelope();
+
+    await transport.consume("fetch", () => handled);
+    broker.connections[0]?.channel.deliver("nutsnews.worker.fetch.v1", delivery);
+    expect(transport.inFlightDeliveryCount).toBe(1);
+
+    const drain = transport.drain(30_000);
+
+    settle?.({
+      action: "ack",
+      reason: "handled",
+      envelope
+    });
+    await drain;
+
+    expect(transport.inFlightDeliveryCount).toBe(0);
+    expect(vi.getTimerCount()).toBe(0);
+    await transport.close();
+  });
+
+  it.each([
+    {
+      attempt: 1,
+      disposition: "retry",
+      exchange: getWorkerRoute("fetch").retryExchange,
+      routingKey: getWorkerRoute("fetch").retryQueues[0]?.routingKey
+    },
+    {
+      attempt: 4,
+      disposition: "dlq",
+      exchange: getWorkerRoute("fetch").dlqExchange,
+      routingKey: getWorkerRoute("fetch").terminalDlq.routingKey
+    }
+  ])("confirms a $disposition transfer for a processor exception and emits exactly one lifecycle disposition", async ({
+    attempt,
+    disposition,
+    exchange,
+    routingKey
+  }) => {
+    if (routingKey === undefined) {
+      throw new Error("fetch retry route is missing");
+    }
+
+    const broker = createFakeBroker();
+    const telemetry = createBufferedRuntimeTelemetrySink();
+    const transport = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: broker.connect,
+      telemetry
+    });
+
+    await transport.consume("fetch", () => Promise.reject(new Error("state store unavailable")));
+    const delivery = createMinimalFetchDelivery(attempt === 1 ? {} : {
+      envelope: {
+        attempt: {
+          count: attempt,
+          max: 4,
+          firstAttemptAt: "2026-07-23T00:00:00.000Z",
+          lastAttemptAt: "2026-07-23T00:20:00.000Z"
+        }
+      }
+    });
+    const channel = broker.connections[0]?.channel;
+
+    if (channel === undefined) {
+      throw new Error("expected a connected fake channel");
+    }
+
+    const message = channel.deliver("nutsnews.worker.fetch.v1", delivery);
+
+    await waitForSettlement(channel);
+    expect(channel.publishes).toHaveLength(1);
+    expect(channel.publishes[0]).toMatchObject({
+      exchange,
+      routingKey
+    });
+    expect(channel.acknowledgements).toEqual([
+      message
+    ]);
+    expect(channel.negativeAcknowledgements).toHaveLength(0);
+
+    const lifecycle = telemetry.events.filter((event) =>
+      event.name === "runtime.message.retry" || event.name === "runtime.message.dlq"
+    );
+
+    expect(lifecycle).toHaveLength(1);
+    expect(lifecycle[0]).toMatchObject({
+      name: `runtime.message.${disposition}`,
+      stage: "fetch",
+      outcome: disposition,
+      attributes: {
+        reason: "processor-exception",
+        error: "Error"
+      }
+    });
+
+    const published = JSON.parse(channel.publishes[0]?.content.toString("utf8") ?? "{}") as {
+      readonly envelope?: {
+        readonly attempt?: {
+          readonly count?: number;
+        };
+      };
+    };
+
+    expect(published.envelope?.attempt?.count).toBe(disposition === "retry" ? 2 : 4);
+
+    await transport.close();
+  });
 });
 
-function createFakeBroker(): FakeBroker {
+function createFakeBroker(options: FakeBrokerOptions = {}): FakeBroker {
   const connections: FakeConnection[] = [];
 
   return {
     connections,
     connect: (url: string): Promise<ChannelModel> => {
       expect(url).toBe("amqp://fetcher:test@example.invalid:5672");
-      const connection = createFakeConnection();
+      const connection = createFakeConnection(options);
       connections.push(connection);
       return Promise.resolve(connection.toChannelModel());
     }
   };
 }
 
-function createFakeConnection(): FakeConnection {
-  const channel = createFakeChannel();
+function createFakeConnection(options: FakeBrokerOptions): FakeConnection {
+  const channel = createFakeChannel(options);
   const closeHandlers: CloseHandler[] = [];
+  const closeCalls: string[] = [];
   const connection = {
     createConfirmChannel(): Promise<ConfirmChannel> {
       return Promise.resolve(channel.toConfirmChannel());
     },
     close(): Promise<void> {
+      closeCalls.push("close");
       for (const handler of closeHandlers) {
         handler();
       }
@@ -131,6 +452,7 @@ function createFakeConnection(): FakeConnection {
 
   return {
     channel,
+    closeCalls,
     emitClose(): void {
       for (const handler of closeHandlers) {
         handler();
@@ -142,48 +464,154 @@ function createFakeConnection(): FakeConnection {
   };
 }
 
-function createFakeChannel(): FakeChannel {
+function createFakeChannel(options: FakeBrokerOptions): FakeChannel {
+  const assertedExchanges: string[] = [];
+  const assertedQueues: string[] = [];
+  const bindings: FakeChannel["bindings"] = [];
+  const cancelCalls: string[] = [];
+  const closeCalls: string[] = [];
   const consumeQueues: string[] = [];
   const prefetchCalls: number[] = [];
-  const closeHandlers: CloseHandler[] = [];
+  const publishes: FakeChannel["publishes"] = [];
+  const acknowledgements: ConsumeMessage[] = [];
+  const negativeAcknowledgements: FakeChannel["negativeAcknowledgements"] = [];
+  const consumers = new Map<string, (message: ConsumeMessage | null) => void>();
+  const eventHandlers = new Map<string, Set<(...args: unknown[]) => void>>();
   const channel = {
+    assertExchange(exchange: string): Promise<void> {
+      assertedExchanges.push(exchange);
+      return Promise.resolve();
+    },
+    async assertQueue(queue: string): Promise<void> {
+      assertedQueues.push(queue);
+      await options.assertQueue?.(queue);
+    },
+    bindQueue(queue: string, exchange: string, routingKey: string): Promise<void> {
+      bindings.push({
+        queue,
+        exchange,
+        routingKey
+      });
+      return Promise.resolve();
+    },
     prefetch(count: number): Promise<void> {
       prefetchCalls.push(count);
       return Promise.resolve();
     },
     consume(queue: string, onMessage: (message: ConsumeMessage | null) => void): Promise<{ readonly consumerTag: string }> {
-      void onMessage;
       consumeQueues.push(queue);
+      consumers.set(queue, onMessage);
       return Promise.resolve({
         consumerTag: `consumer-${String(consumeQueues.length)}`
       });
     },
-    cancel(): Promise<void> {
-      return Promise.resolve();
+    cancel(consumerTag: string): Promise<void> {
+      cancelCalls.push(consumerTag);
+      return options.cancel?.(consumerTag) ?? Promise.resolve();
     },
     close(): Promise<void> {
-      for (const handler of closeHandlers) {
-        handler();
-      }
+      closeCalls.push("close");
+      emitChannelEvent(eventHandlers, "close");
 
       return Promise.resolve();
     },
     on(event: string, handler: unknown): unknown {
-      if (event === "close" && isCloseHandler(handler)) {
-        closeHandlers.push(handler);
+      if (typeof handler === "function") {
+        const handlers = eventHandlers.get(event) ?? new Set<(...args: unknown[]) => void>();
+
+        handlers.add(handler as (...args: unknown[]) => void);
+        eventHandlers.set(event, handlers);
       }
 
       return channel;
+    },
+    off(event: string, handler: unknown): unknown {
+      if (typeof handler === "function") {
+        eventHandlers.get(event)?.delete(handler as (...args: unknown[]) => void);
+      }
+
+      return channel;
+    },
+    publish(
+      exchange: string,
+      routingKey: string,
+      content: Buffer,
+      _options: unknown,
+      callback: (error: unknown) => void
+    ): boolean {
+      publishes.push({
+        exchange,
+        routingKey,
+        content
+      });
+      queueMicrotask(() => {
+        callback(null);
+      });
+      return true;
+    },
+    ack(message: ConsumeMessage): void {
+      acknowledgements.push(message);
+    },
+    nack(message: ConsumeMessage, _allUpTo?: boolean, requeue?: boolean): void {
+      negativeAcknowledgements.push({
+        message,
+        requeue
+      });
     }
   };
 
   return {
+    assertedExchanges,
+    assertedQueues,
+    bindings,
+    cancelCalls,
+    closeCalls,
     consumeQueues,
     prefetchCalls,
+    publishes,
+    acknowledgements,
+    negativeAcknowledgements,
+    deliver(queue: string, carrier: unknown): ConsumeMessage {
+      const consumer = consumers.get(queue);
+
+      if (consumer === undefined) {
+        throw new Error(`No fake consumer for ${queue}.`);
+      }
+
+      const message = {
+        content: Buffer.from(JSON.stringify(carrier), "utf8")
+      } as ConsumeMessage;
+
+      consumer(message);
+      return message;
+    },
     toConfirmChannel(): ConfirmChannel {
       return channel as unknown as ConfirmChannel;
     }
   };
+}
+
+function emitChannelEvent(
+  handlers: ReadonlyMap<string, ReadonlySet<(...args: unknown[]) => void>>,
+  event: string
+): void {
+  for (const handler of handlers.get(event) ?? []) {
+    handler();
+  }
+}
+
+async function waitForSettlement(channel: FakeChannel): Promise<void> {
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    if (channel.acknowledgements.length + channel.negativeAcknowledgements.length > 0) {
+      return;
+    }
+
+    await new Promise<void>((resolve) => {
+      setImmediate(resolve);
+    });
+  }
+
+  throw new Error("fake RabbitMQ delivery did not settle");
 }
 
 function isCloseHandler(handler: unknown): handler is CloseHandler {

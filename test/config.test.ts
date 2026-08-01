@@ -18,9 +18,13 @@ describe("loadFetcherConfig", () => {
     expect(config).toMatchObject({
       serviceName: "nutsnews-worker-feed-fetcher",
       dependencyMode: "test",
+      deploymentMode: "shadow",
+      expectedActive: false,
+      buildRevision: "unknown",
       host: "fetcher-host",
       concurrency: 8,
-      prefetch: 16,
+      prefetch: 8,
+      startupTimeoutMs: 30_000,
       shadowMode: true,
       fetchPolicy: {
         maxRetryAfterMs: 1_800_000,
@@ -41,12 +45,14 @@ describe("loadFetcherConfig", () => {
 
   it("fails production config by missing secret names only", () => {
     expect(() => loadFetcherConfig({
-      NUTSNEWS_FETCHER_DEPENDENCY_MODE: "production"
+      NUTSNEWS_FETCHER_DEPENDENCY_MODE: "production",
+      NUTSNEWS_FETCHER_BUILD_REVISION: "501ededcad48924b632b0547679f4dcb54ed4a90"
     })).toThrow(FetcherConfigError);
 
     try {
       loadFetcherConfig({
-        NUTSNEWS_FETCHER_DEPENDENCY_MODE: "production"
+        NUTSNEWS_FETCHER_DEPENDENCY_MODE: "production",
+        NUTSNEWS_FETCHER_BUILD_REVISION: "501ededcad48924b632b0547679f4dcb54ed4a90"
       });
     } catch (error: unknown) {
       expect(error).toBeInstanceOf(FetcherConfigError);
@@ -67,6 +73,7 @@ describe("loadFetcherConfig", () => {
       NUTSNEWS_FETCHER_PREFETCH: "4",
       NUTSNEWS_FETCHER_CONNECT_TIMEOUT_MS: "20000",
       NUTSNEWS_FETCHER_TOTAL_TIMEOUT_MS: "10000",
+      NUTSNEWS_FETCHER_STARTUP_TIMEOUT_MS: "99",
       NUTSNEWS_FETCHER_SHADOW_MODE: "false"
     })).toThrow(FetcherConfigError);
   });
@@ -76,6 +83,7 @@ describe("loadFetcherConfig", () => {
       NUTSNEWS_FETCHER_DEPENDENCY_MODE: "production",
       NUTSNEWS_FETCHER_DATABASE_URL: "postgres://example.invalid/worker",
       NUTSNEWS_FETCHER_RABBITMQ_URL: "amqp://example.invalid",
+      NUTSNEWS_FETCHER_BUILD_REVISION: "501ededcad48924b632b0547679f4dcb54ed4a90",
       NUTSNEWS_FETCHER_TELEMETRY_LOGS: "silent"
     });
 
@@ -83,7 +91,20 @@ describe("loadFetcherConfig", () => {
       databaseConfigured: true,
       rabbitmqConfigured: true
     });
+    expect(config.buildRevision).toBe("501ededcad48924b632b0547679f4dcb54ed4a90");
+    expect(config.deploymentMode).toBe("shadow");
+    expect(config.expectedActive).toBe(false);
     expect(JSON.stringify(config)).not.toContain("postgres://example.invalid");
     expect(JSON.stringify(config)).not.toContain("amqp://example.invalid");
+  });
+
+  it("rejects unbounded build revision labels", () => {
+    expect(() => loadFetcherConfig({
+      NUTSNEWS_FETCHER_BUILD_REVISION: `revision-${"x".repeat(200)}`
+    })).toThrow(FetcherConfigError);
+
+    expect(() => loadFetcherConfig({
+      NUTSNEWS_FETCHER_BUILD_REVISION: "revision with spaces"
+    })).toThrow(FetcherConfigError);
   });
 });

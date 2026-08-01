@@ -43,12 +43,14 @@
     "@ramideltoro/nutsnews-worker-runtime": "0.5.0",
     "amqplib": "^2.0.1",
     "fast-xml-parser": "^5.10.1",
+    "pg": "^8.22.0",
     "undici": "^8.9.0"
   },
   "devDependencies": {
     "@eslint/js": "^9.32.0",
     "@types/amqplib": "^0.10.8",
     "@types/node": "^24.1.0",
+    "@types/pg": "^8.20.3",
     "eslint": "^9.32.0",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.38.0",

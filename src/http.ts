@@ -3,14 +3,14 @@ import { timingSafeEqual } from "node:crypto";
 import type { AddressInfo } from "node:net";
 
 import {
-  runtimeHealthEndpointResponse,
-  type PrometheusRuntimeTelemetrySink
+  runtimeHealthEndpointResponse
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import {
   FETCHER_CONFIG_SCHEMA,
   type FetcherConfig
 } from "./config.js";
+import { collectFetcherTelemetryStatusMetrics } from "./metrics.js";
 import {
   FETCHER_RECONCILIATION_PATH,
   type FetcherReconciliationRequest,
@@ -21,7 +21,9 @@ import type { FetcherService } from "./service.js";
 export interface FetcherHttpServerOptions {
   readonly config: FetcherConfig;
   readonly service: FetcherService;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
+  readonly metrics?: {
+    collect(): string;
+  };
   readonly reconciler?: FetcherReconciler;
   readonly reconciliationToken?: string;
 }
@@ -102,7 +104,8 @@ async function routeRequest(
       writeHealth(response, await options.service.health.readiness());
       return;
     case "/metrics":
-      writeText(response, 200, options.metrics?.collect() ?? "", "text/plain; version=0.0.4; charset=utf-8");
+      await refreshReadinessForMetrics(options.service);
+      writeText(response, 200, collectMetrics(options.metrics, options.config), "text/plain; version=0.0.4; charset=utf-8");
       return;
     case "/config-schema":
       writeJson(response, 200, {
@@ -115,6 +118,38 @@ async function routeRequest(
       writeJson(response, 404, {
         status: "not-found"
       });
+  }
+}
+
+async function refreshReadinessForMetrics(service: FetcherService): Promise<void> {
+  // Startup diagnostics must remain non-blocking while dependency probes are
+  // still settling. Once startup completes, every scrape refreshes readiness.
+  if (!service.isStarted) {
+    return;
+  }
+
+  try {
+    await service.health.readiness();
+  } catch {
+    // The service-owned health observer records an unhealthy readiness value.
+    // Diagnostics must remain scrapeable even if evaluation itself fails.
+  }
+}
+
+function collectMetrics(
+  metrics: FetcherHttpServerOptions["metrics"],
+  config: FetcherConfig
+): string {
+  try {
+    return metrics?.collect() ?? `${collectFetcherTelemetryStatusMetrics({
+      environment: config.environment,
+      service: config.serviceName
+    }, config.metricsEnabled, false)}\n`;
+  } catch {
+    return `${collectFetcherTelemetryStatusMetrics({
+      environment: config.environment,
+      service: config.serviceName
+    }, config.metricsEnabled, false)}\n`;
   }
 }
 
@@ -173,7 +208,7 @@ async function handleReconciliationRequest(
   }
 
   const report = await options.reconciler.reconcile(body);
-  const statusCode = report.status === "dry_run"
+  const statusCode = report.status === "dry_run" || report.status === "applied"
     ? 200
     : report.status === "kill_switch_active"
       ? 423

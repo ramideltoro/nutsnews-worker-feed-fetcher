@@ -3,17 +3,23 @@ import { pathToFileURL } from "node:url";
 import { getContractPackageMetadata } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   createJsonRuntimeTelemetrySink,
-  createPrometheusRuntimeTelemetrySink,
   createRuntimeShutdownController,
   getRuntimePackageMetadata,
   SYSTEM_RUNTIME_CLOCK,
-  type RuntimeTelemetrySink
+  type RuntimeClock
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import {
   loadFetcherConfig,
   type FetcherConfig
 } from "./config.js";
+import type {
+  FetcherBrokerTransport,
+  FetcherDnsPolicy,
+  FetcherDurableStateStore,
+  FetcherHttpClient
+} from "./dependencies.js";
+import { fetcherDependencyAdapterIdentity } from "./dependencies.js";
 import { createFetcherHttpServer } from "./http.js";
 import { createFeedFetchWorkHandler } from "./ingestion.js";
 import {
@@ -22,27 +28,42 @@ import {
 } from "./network.js";
 import { PayloadRabbitMqTransport } from "./rabbitmq-transport.js";
 import {
-  createFetcherFailClosedReconciler
+  createFetcherOutboxReconciler
 } from "./reconciliation.js";
 import { createFetcherService } from "./service.js";
 import {
-  InMemoryFetcherStateStore,
   createLocalFetcherDependencies
 } from "./test-doubles.js";
+import {
+  createFetcherPrometheusMetricsSink,
+  type FetcherMetricIdentity
+} from "./metrics.js";
+import { createFetcherStateStore } from "./state-store.js";
+import {
+  bestEffortFetcherMetricsSink,
+  bestEffortTelemetryFlusher,
+  combineBestEffortTelemetrySinks
+} from "./telemetry-safety.js";
 
 export {
   FETCHER_CONFIG_SCHEMA,
   FETCHER_SERVICE_NAME,
   FETCHER_SERVICE_VERSION,
   loadFetcherConfig,
-  type FetcherConfig
+  type FetcherConfig,
+  type FetcherDeploymentMode
 } from "./config.js";
 export type {
   FetcherCandidateClaim,
   FetcherCandidateClaimResult,
   FetcherCandidatePublication,
+  FetcherCandidatePublicationFailure,
   FetcherCandidateReference,
+  FetcherAggregateAdapterMode,
+  FetcherBrokerTransport,
   FetcherDependencies,
+  FetcherDependencyAdapterIdentity,
+  FetcherDependencyAdapterMode,
   FetcherDependencyProbe,
   FetcherDnsPolicy,
   FetcherDnsPolicyDecision,
@@ -53,9 +74,13 @@ export type {
   FetcherHttpClient,
   FetcherHttpRequest,
   FetcherHttpResponse,
+  FetcherPendingCandidatePublication,
+  FetcherPendingPublicationQuery,
+  FetcherStateStoreMode,
   FetcherWorkTools,
   FetcherWorkHandler
 } from "./dependencies.js";
+export { fetcherDependencyAdapterIdentity } from "./dependencies.js";
 export {
   createFetcherHttpServer,
   type FetcherHttpServer
@@ -64,6 +89,16 @@ export {
   createFeedFetchWorkHandler,
   type FeedFetchWorkHandlerOptions
 } from "./ingestion.js";
+export {
+  FETCHER_METRIC_LABELS,
+  FETCHER_STAGE_LATENCY_BUCKETS_SECONDS,
+  FETCHER_STAGE_METRIC_OUTCOMES,
+  createFetcherPrometheusMetricsSink,
+  type FetcherBaseMetricsSink,
+  type FetcherPrometheusMetricsSink,
+  type FetcherPrometheusMetricsSinkOptions,
+  type FetcherStageMetricOutcome
+} from "./metrics.js";
 export {
   SequenceFetcherIdFactory,
   createCryptoFetcherIdFactory,
@@ -94,12 +129,31 @@ export {
   FETCHER_RECONCILIATION_CONFIRMATION,
   FETCHER_RECONCILIATION_PATH,
   createFetcherFailClosedReconciler,
+  createFetcherOutboxReconciler,
   type FetcherReconciliationReport,
   type FetcherReconciliationRequest,
   type FetcherReconciler
 } from "./reconciliation.js";
 export {
+  FETCHER_PRODUCTION_STATE_STORE_MODE,
+  FetcherStateStoreUnavailableError,
   InMemoryFetcherStateStore,
+  UnsupportedProductionFetcherStateStore,
+  createFetcherStateStore,
+  expectedFetcherStateStoreMode
+} from "./state-store.js";
+export {
+  FETCHER_POSTGRES_SCHEMA,
+  FETCHER_POSTGRES_STATE_CONTRACT_VERSION,
+  FETCHER_FETCH_OUTCOME_RETENTION_DAYS,
+  FetcherStateContractError,
+  FetcherStateOwnershipError,
+  PostgresFetcherStateStore,
+  createPostgresFetcherPool,
+  type PostgresFetcherPoolOptions,
+  type PostgresFetcherStateStoreOptions
+} from "./postgres-state-store.js";
+export {
   LocalBrokerTransport,
   LocalDnsPolicy,
   LocalFetcherWorkHandler,
@@ -115,45 +169,83 @@ export interface FetcherApplication {
   readonly config: FetcherConfig;
   start(): Promise<void>;
   stop(): Promise<void>;
+  url(path?: string): string;
 }
 
-export function createFetcherApplication(config = loadFetcherConfig()): FetcherApplication {
-  const identity = {
+export interface FetcherApplicationAdapters {
+  readonly clock?: RuntimeClock;
+  readonly stateStore?: FetcherDurableStateStore;
+  readonly brokerTransport?: FetcherBrokerTransport;
+  readonly httpClient?: FetcherHttpClient;
+  readonly dnsPolicy?: FetcherDnsPolicy;
+}
+
+export function createFetcherApplication(
+  config = loadFetcherConfig(),
+  adapters: FetcherApplicationAdapters = {}
+): FetcherApplication {
+  const clock = adapters.clock ?? SYSTEM_RUNTIME_CLOCK;
+  const databaseUrl = adapters.stateStore === undefined && config.dependencyMode === "production"
+    ? requiredEnv("NUTSNEWS_FETCHER_DATABASE_URL")
+    : undefined;
+  const stateStore = adapters.stateStore ?? createFetcherStateStore(config, clock, {
+    ...(databaseUrl === undefined ? {} : {
+      databaseUrl
+    })
+  });
+  const httpClient = adapters.httpClient ?? new NodeFetcherHttpClient();
+  const dnsPolicy = adapters.dnsPolicy ?? new DefaultFetcherDnsPolicy();
+  const brokerAdapterMode = adapters.brokerTransport?.adapterMode
+    ?? (config.dependencyMode === "production" ? "production" : "test");
+  const dependencyAdapters = fetcherDependencyAdapterIdentity({
+    stateStore,
+    httpClient,
+    dnsPolicy,
+    brokerTransport: {
+      adapterMode: brokerAdapterMode
+    }
+  });
+  const identity: FetcherMetricIdentity = {
     service: config.serviceName,
     version: config.serviceVersion,
     environment: config.environment,
-    host: config.host
+    host: config.host,
+    revision: config.buildRevision,
+    deployment: config.deploymentMode,
+    adapter: dependencyAdapters.aggregate
   };
-  const logSink = config.telemetryLogs === "stdout"
+  const logSink = bestEffortTelemetryFlusher(config.telemetryLogs === "stdout"
     ? createJsonRuntimeTelemetrySink({
         identity,
         writer: (line) => {
           console.log(line);
         }
       })
-    : undefined;
-  const metrics = config.metricsEnabled
-    ? createPrometheusRuntimeTelemetrySink({
-        identity
+    : undefined);
+  const metrics = bestEffortFetcherMetricsSink(config.metricsEnabled
+    ? createFetcherPrometheusMetricsSink({
+        identity,
+        config,
+        stateStore
       })
-    : undefined;
-  const telemetry = combineTelemetrySinks(logSink, metrics);
+    : undefined);
+  const telemetry = combineBestEffortTelemetrySinks(logSink, metrics);
   const reconciliationToken = reconciliationTokenFromEnv();
-  const productionBrokerTransport = config.dependencyMode === "production"
+  const productionBrokerTransport = adapters.brokerTransport ?? (config.dependencyMode === "production"
     ? new PayloadRabbitMqTransport({
         url: requiredEnv("NUTSNEWS_FETCHER_RABBITMQ_URL"),
         prefetch: config.prefetch,
-        clock: SYSTEM_RUNTIME_CLOCK,
+        clock,
         ...(telemetry === undefined ? {} : {
           telemetry
         })
       })
-    : undefined;
+    : undefined);
   const baseDependencies = createLocalFetcherDependencies({
-    clock: SYSTEM_RUNTIME_CLOCK,
-    httpClient: new NodeFetcherHttpClient(),
-    dnsPolicy: new DefaultFetcherDnsPolicy(),
-    stateStore: new InMemoryFetcherStateStore(SYSTEM_RUNTIME_CLOCK),
+    clock,
+    httpClient,
+    dnsPolicy,
+    stateStore,
     ...(productionBrokerTransport === undefined ? {} : {
       brokerTransport: productionBrokerTransport
     })
@@ -165,9 +257,6 @@ export function createFetcherApplication(config = loadFetcherConfig()): FetcherA
       dependencies: baseDependencies,
       ...(telemetry === undefined ? {} : {
         telemetry
-      }),
-      ...(metrics === undefined ? {} : {
-        metrics
       })
     })
   };
@@ -184,7 +273,11 @@ export function createFetcherApplication(config = loadFetcherConfig()): FetcherA
   const httpServer = createFetcherHttpServer({
     config,
     service,
-    reconciler: createFetcherFailClosedReconciler(SYSTEM_RUNTIME_CLOCK),
+    reconciler: createFetcherOutboxReconciler({
+      clock,
+      stateStore,
+      publish: (command) => service.broker.publish(command)
+    }),
     ...(reconciliationToken === undefined ? {} : {
       reconciliationToken
     }),
@@ -195,14 +288,43 @@ export function createFetcherApplication(config = loadFetcherConfig()): FetcherA
   const shutdown = createRuntimeShutdownController({
     callbacks: [
       async () => {
-        await httpServer.close();
-      },
-      async () => {
-        await service.stop();
+        let serviceError: Error | undefined;
+        let httpError: Error | undefined;
+
+        // Stop broker intake immediately. HTTP close can wait for an active
+        // readiness/metrics dependency probe, so it must not delay consumer
+        // cancellation or consume the service's drain budget first.
+        const serviceOperation = service.stop().catch((error: unknown) => {
+          serviceError = applicationError(error, "Fetcher service shutdown failed.");
+        });
+        const httpOperation = httpServer.close().catch((error: unknown) => {
+          httpError = applicationError(error, "Fetcher HTTP shutdown failed.");
+        });
+
+        await Promise.all([
+          serviceOperation,
+          httpOperation
+        ]);
+
+        let stateStoreError: Error | undefined;
+
+        try {
+          await stateStore.close?.();
+        } catch (error: unknown) {
+          stateStoreError = applicationError(error, "Fetcher state-store shutdown failed.");
+        }
+
+        const shutdownError = serviceError ?? httpError ?? stateStoreError;
+
+        if (shutdownError !== undefined) {
+          throw shutdownError;
+        }
       }
     ],
     signalSource: process,
-    timeoutMs: config.shutdownTimeoutMs,
+    // Service drain and active diagnostic probes run in parallel. Reserve a
+    // small cleanup window for closing the durable state pool afterwards.
+    timeoutMs: Math.max(config.shutdownTimeoutMs, config.startupTimeoutMs) + 5_000,
     ...(telemetry === undefined ? {} : {
       telemetry
     }),
@@ -215,13 +337,23 @@ export function createFetcherApplication(config = loadFetcherConfig()): FetcherA
     config,
     async start(): Promise<void> {
       assertPackageCompatibility();
-      await service.start();
       await httpServer.listen();
       shutdown.start();
+
+      try {
+        await service.start();
+      } catch (error: unknown) {
+        shutdown.stop();
+        await service.stop().catch(() => undefined);
+        await stateStore.close?.().catch(() => undefined);
+        await httpServer.close().catch(() => undefined);
+        throw error;
+      }
     },
     async stop(): Promise<void> {
       await shutdown.trigger("manual");
-    }
+    },
+    url: (path = "/") => httpServer.url(path)
   };
 }
 
@@ -231,24 +363,6 @@ function reconciliationTokenFromEnv(): string | undefined {
   const token = serviceToken !== undefined && serviceToken.length > 0 ? serviceToken : globalToken;
 
   return token === undefined || token.length === 0 ? undefined : token;
-}
-
-function combineTelemetrySinks(
-  ...sinks: readonly (RuntimeTelemetrySink | undefined)[]
-): RuntimeTelemetrySink | undefined {
-  const configured = sinks.filter((sink): sink is RuntimeTelemetrySink => sink !== undefined);
-
-  if (configured.length === 0) {
-    return undefined;
-  }
-
-  return {
-    emit: async (event) => {
-      for (const sink of configured) {
-        await sink.emit(event);
-      }
-    }
-  };
 }
 
 export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "0.5.0";
@@ -276,6 +390,10 @@ function requiredEnv(key: string): string {
   }
 
   return value;
+}
+
+function applicationError(error: unknown, fallbackMessage: string): Error {
+  return error instanceof Error ? error : new Error(fallbackMessage);
 }
 
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {

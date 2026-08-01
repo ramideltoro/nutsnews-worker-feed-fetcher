@@ -1,5 +1,6 @@
 import {
   WORKER_DELIVERY_BEHAVIOR,
+  getRetryDestination,
   getWorkerRoute,
   type WorkerMessageEnvelope,
   type WorkerRoute,
@@ -9,6 +10,8 @@ import {
   computeRetryJitterMs,
   createBrokerConsumerMonitor,
   createRetryEnvelope,
+  emitRuntimeTelemetry,
+  assertRabbitMqTopology,
   randomUuidMessageIdFactory,
   runtimeNow,
   runtimeTraceHeadersFromEnvelope,
@@ -18,7 +21,7 @@ import {
   type BrokerDeliveryHandler,
   type BrokerPublishCommand,
   type BrokerPublishReceipt,
-  type RuntimeBrokerTransport,
+  type RabbitMqConfirmChannel,
   type RuntimeClock,
   type RuntimeMessageProcessingResult,
   type RuntimeTelemetrySink
@@ -30,6 +33,9 @@ import {
   type ConsumeMessage,
   type Options
 } from "amqplib";
+
+import type { FetcherBrokerTransport } from "./dependencies.js";
+import { bestEffortTelemetrySink } from "./telemetry-safety.js";
 
 const DEFAULT_CONFIRM_TIMEOUT_MS = WORKER_DELIVERY_BEHAVIOR.confirmTimeoutMs;
 const DEFAULT_DRAIN_TIMEOUT_MS = 30_000;
@@ -47,7 +53,8 @@ interface PayloadConsumerRegistration {
 
 type RabbitMqConnect = (url: string) => Promise<ChannelModel>;
 
-export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
+export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
+  readonly adapterMode = "production" as const;
   readonly name = "rabbitmq-payload-transport";
 
   private readonly url: string;
@@ -59,6 +66,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   private readonly inFlight = new Set<Promise<void>>();
   private connection: ChannelModel | undefined;
   private channel: ConfirmChannel | undefined;
+  private channelOperation: Promise<ConfirmChannel> | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnecting = false;
   private routes: readonly WorkerRoute[] = [];
@@ -74,7 +82,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     this.url = options.url;
     this.prefetchCount = options.prefetch;
     this.clock = options.clock;
-    this.telemetry = options.telemetry;
+    this.telemetry = bestEffortTelemetrySink(options.telemetry);
     this.connectToBroker = options.connect ?? amqpConnect;
   }
 
@@ -92,8 +100,14 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   }
 
   async assertTopology(routes: readonly WorkerRoute[]): Promise<void> {
+    const channelExists = this.channel !== undefined;
+
     this.routes = routes;
-    await this.ensureChannel();
+    const channel = await this.ensureChannel();
+
+    if (channelExists) {
+      await assertPayloadRabbitMqTopology(channel, routes);
+    }
   }
 
   async publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
@@ -162,71 +176,119 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       return;
     }
 
-    await Promise.race([
-      Promise.all([...this.inFlight]).then(() => undefined),
-      new Promise<void>((_, reject) => {
-        setTimeout(() => {
-          reject(new Error("Timed out waiting for RabbitMQ payload deliveries to drain."));
-        }, timeoutMs);
-      })
-    ]);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+
+    try {
+      await Promise.race([
+        Promise.all([...this.inFlight]).then(() => undefined),
+        new Promise<void>((_, reject) => {
+          timeout = setTimeout(() => {
+            reject(new Error("Timed out waiting for RabbitMQ payload deliveries to drain."));
+          }, timeoutMs);
+        })
+      ]);
+    } finally {
+      if (timeout !== undefined) {
+        clearTimeout(timeout);
+      }
+    }
   }
 
   async close(): Promise<void> {
     this.closing = true;
     this.clearReconnectTimer();
     const channel = this.channel;
+    const connection = this.connection;
+
+    this.channel = undefined;
+    this.connection = undefined;
 
     if (channel !== undefined) {
       for (const registration of this.consumers.values()) {
         if (registration.consumerTag !== undefined) {
-          await channel.cancel(registration.consumerTag).catch(() => undefined);
+          // A broker RPC can hang after a network partition. Cancellation is
+          // best effort here because the connection close below is the hard
+          // intake boundary and must always be initiated.
+          void channel.cancel(registration.consumerTag).catch(() => undefined);
         }
         registration.monitor.markClosed("transport-closing");
       }
     }
 
     this.consumers.clear();
-    await this.drain().catch(() => undefined);
+    // Managed lifecycle shutdown drains before close. A direct close is the
+    // bounded force-close path after that graceful drain times out, so it must
+    // not repeat the same wait and strand the connection for another window.
+    this.inFlight.clear();
 
-    if (this.channel !== undefined) {
-      await this.channel.close().catch(() => undefined);
-      this.channel = undefined;
-    }
-
-    if (this.connection !== undefined) {
-      await this.connection.close().catch(() => undefined);
-      this.connection = undefined;
-    }
+    // Initiate both closes concurrently. In particular, do not wait for a
+    // channel RPC before starting the connection close that tears down the
+    // underlying socket. The service-level wrapper bounds this whole call.
+    await Promise.all([
+      channel?.close().catch(() => undefined),
+      connection?.close().catch(() => undefined)
+    ]);
   }
 
   private async ensureChannel(): Promise<ConfirmChannel> {
+    if (this.closingRequested()) {
+      throw new Error("RabbitMQ payload transport is closing.");
+    }
+
+    if (this.channelOperation !== undefined) {
+      return this.channelOperation;
+    }
+
     if (this.channel !== undefined) {
       return this.channel;
     }
 
+    const operation = this.openChannel();
+
+    this.channelOperation = operation;
+
+    try {
+      return await operation;
+    } finally {
+      if (this.channelOperation === operation) {
+        this.channelOperation = undefined;
+      }
+    }
+  }
+
+  private async openChannel(): Promise<ConfirmChannel> {
+    const connection = await this.connectToBroker(this.url);
+
     if (this.closing) {
-      throw new Error("RabbitMQ payload transport is closing.");
+      await connection.close().catch(() => undefined);
+      throw new Error("RabbitMQ payload transport closed while connecting.");
     }
 
-    const connection = await this.connectToBroker(this.url);
-    const channel = await connection.createConfirmChannel();
+    let channel: ConfirmChannel;
+
+    try {
+      channel = await connection.createConfirmChannel();
+    } catch (error: unknown) {
+      await connection.close().catch(() => undefined);
+      throw error;
+    }
+
+    if (this.closingRequested()) {
+      await Promise.all([
+        channel.close().catch(() => undefined),
+        connection.close().catch(() => undefined)
+      ]);
+      throw new Error("RabbitMQ payload transport closed while opening a channel.");
+    }
+
     this.connection = connection;
     this.channel = channel;
 
     connection.on("close", () => {
-      if (this.connection === connection) {
-        this.connection = undefined;
-      }
-
       this.markChannelClosed(channel, "connection-closed");
       this.scheduleConsumerReconnect();
     });
     connection.on("error", () => {
-      if (this.connection === connection) {
-        this.connection = undefined;
-      }
-
       this.markChannelClosed(channel, "connection-error");
       this.scheduleConsumerReconnect();
     });
@@ -239,9 +301,38 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       this.scheduleConsumerReconnect();
     });
 
-    await this.restoreConsumers(channel);
+    try {
+      if (this.routes.length > 0) {
+        await assertPayloadRabbitMqTopology(channel, this.routes);
+      }
+      await this.restoreConsumers(channel);
+    } catch (error: unknown) {
+      if (this.channel === channel) {
+        this.channel = undefined;
+      }
+      if (this.connection === connection) {
+        this.connection = undefined;
+      }
+      await Promise.all([
+        channel.close().catch(() => undefined),
+        connection.close().catch(() => undefined)
+      ]);
+      throw error;
+    }
+
+    if (this.closingRequested() || this.channel !== channel || this.connection !== connection) {
+      await Promise.all([
+        channel.close().catch(() => undefined),
+        connection.close().catch(() => undefined)
+      ]);
+      throw new Error("RabbitMQ channel changed while consumers were being restored.");
+    }
 
     return channel;
+  }
+
+  private closingRequested(): boolean {
+    return this.closing;
   }
 
   private async restoreConsumers(channel: ConfirmChannel): Promise<void> {
@@ -270,11 +361,16 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
         return;
       }
 
-      const tracked = this.handleDelivery(registration.handler, message);
+      const tracked = this.handleDelivery(stage, registration.handler, message);
       this.inFlight.add(tracked);
-      void tracked.finally(() => {
-        this.inFlight.delete(tracked);
-      });
+      void tracked.then(
+        () => {
+          this.inFlight.delete(tracked);
+        },
+        () => {
+          this.inFlight.delete(tracked);
+        }
+      );
     }, {
       noAck: false
     });
@@ -289,9 +385,16 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
     }
 
     this.channel = undefined;
+    const connection = this.connection;
+
+    this.connection = undefined;
     for (const registration of this.consumers.values()) {
       registration.consumerTag = undefined;
       registration.monitor.markChannelDropped(reason);
+    }
+
+    if (!this.closing && connection !== undefined) {
+      void connection.close().catch(() => undefined);
     }
   }
 
@@ -351,6 +454,7 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
   }
 
   private async handleDelivery(
+    stage: WorkerStage,
     handler: BrokerDeliveryHandler,
     message: ConsumeMessage
   ): Promise<void> {
@@ -360,17 +464,135 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
       return;
     }
 
+    let carrier: PayloadCarrier;
+
     try {
-      const carrier = decodeCarrier(message);
-      const result = await handler({
+      carrier = decodeCarrier(message);
+    } catch (error: unknown) {
+      channel.nack(message, false, false);
+      await emitRuntimeTelemetry(this.telemetry, {
+        name: "runtime.message.invalid",
+        level: "warn",
+        at: runtimeNow(this.clock),
+        stage,
+        queue: getWorkerRoute(stage).mainQueue.name,
+        outcome: "failure",
+        attributes: {
+          issueCode: "invalid-payload-carrier",
+          error: classifyTransportError(error)
+        }
+      });
+      return;
+    }
+
+    const startedAtMs = this.clock.now().getTime();
+    let result: RuntimeMessageProcessingResult;
+
+    try {
+      result = await handler({
         envelope: carrier.envelope,
         payload: carrier.payload,
         receivedAt: runtimeNow(this.clock)
       });
-      await this.settleDelivery(channel, message, carrier, result);
-    } catch {
-      channel.nack(message, false, false);
+    } catch (error: unknown) {
+      try {
+        await this.settleProcessorFailure(channel, message, carrier, error, elapsedMs(this.clock, startedAtMs));
+      } catch (settlementError: unknown) {
+        channel.nack(message, false, true);
+        await emitProcessorFailureDisposition(
+          this.telemetry,
+          this.clock,
+          carrier.envelope,
+          "retry",
+          "broker-requeue",
+          error,
+          elapsedMs(this.clock, startedAtMs),
+          classifyTransportError(settlementError)
+        );
+      }
+      return;
     }
+
+    try {
+      await this.settleDelivery(channel, message, carrier, result);
+    } catch (error: unknown) {
+      // A failed or ambiguous transfer confirmation must retain the original
+      // delivery. Redelivery may duplicate a confirmed-but-unobserved publish,
+      // which downstream idempotency handles; dropping the source is unsafe.
+      channel.nack(message, false, true);
+      await emitRuntimeTelemetry(this.telemetry, {
+        name: "runtime.dependency.observed",
+        level: "error",
+        at: runtimeNow(this.clock),
+        stage: carrier.envelope.route,
+        queue: getWorkerRoute(carrier.envelope.route).mainQueue.name,
+        durationMs: elapsedMs(this.clock, startedAtMs),
+        outcome: "failure",
+        attributes: {
+          dependency: "broker-settlement",
+          error: classifyTransportError(error)
+        }
+      });
+    }
+  }
+
+  private async settleProcessorFailure(
+    channel: ConfirmChannel,
+    message: ConsumeMessage,
+    carrier: PayloadCarrier,
+    error: unknown,
+    durationMs: number
+  ): Promise<void> {
+    const envelope = carrier.envelope;
+    const route = getWorkerRoute(envelope.route);
+    const destination = getRetryDestination(envelope.route, envelope.attempt.count);
+
+    if ("ttlMs" in destination) {
+      const retryEnvelope = createRetryEnvelope(envelope, {
+        now: runtimeNow(this.clock),
+        messageIdFactory: randomUuidMessageIdFactory
+      });
+      const retryJitterMs = computeRetryJitterMs(destination.ttlMs, 0.1);
+
+      await publishCarrierWithConfirm(channel, {
+        carrier: {
+          envelope: retryEnvelope,
+          payload: carrier.payload
+        },
+        exchange: route.retryExchange,
+        routingKey: destination.routingKey,
+        confirmTimeoutMs: DEFAULT_CONFIRM_TIMEOUT_MS,
+        retryJitterMs
+      });
+      await emitProcessorFailureDisposition(
+        this.telemetry,
+        this.clock,
+        envelope,
+        "retry",
+        destination.name,
+        error,
+        durationMs
+      );
+      channel.ack(message);
+      return;
+    }
+
+    await publishCarrierWithConfirm(channel, {
+      carrier,
+      exchange: route.dlqExchange,
+      routingKey: destination.routingKey,
+      confirmTimeoutMs: DEFAULT_CONFIRM_TIMEOUT_MS
+    });
+    await emitProcessorFailureDisposition(
+      this.telemetry,
+      this.clock,
+      envelope,
+      "dlq",
+      destination.name,
+      error,
+      durationMs
+    );
+    channel.ack(message);
   }
 
   private async settleDelivery(
@@ -420,6 +642,56 @@ export class PayloadRabbitMqTransport implements RuntimeBrokerTransport {
 
     channel.nack(message, false, false);
   }
+}
+
+async function emitProcessorFailureDisposition(
+  telemetry: RuntimeTelemetrySink | undefined,
+  clock: RuntimeClock,
+  envelope: WorkerMessageEnvelope,
+  disposition: "retry" | "dlq",
+  destination: string,
+  error: unknown,
+  durationMs: number,
+  settlementError?: string
+): Promise<void> {
+  await emitRuntimeTelemetry(telemetry, {
+    name: disposition === "retry" ? "runtime.message.retry" : "runtime.message.dlq",
+    level: disposition === "retry" ? "warn" : "error",
+    at: runtimeNow(clock),
+    stage: envelope.route,
+    queue: getWorkerRoute(envelope.route).mainQueue.name,
+    messageId: envelope.messageId,
+    idempotencyKey: envelope.idempotencyKey,
+    correlationId: envelope.correlationId,
+    causationId: envelope.causationId,
+    traceparent: envelope.traceparent,
+    ...(envelope.tracestate === undefined ? {} : {
+      tracestate: envelope.tracestate
+    }),
+    attempt: envelope.attempt.count,
+    durationMs,
+    outcome: disposition,
+    attributes: {
+      reason: "processor-exception",
+      destination,
+      error: classifyTransportError(error),
+      ...(settlementError === undefined ? {} : {
+        settlementError
+      })
+    }
+  });
+}
+
+function elapsedMs(clock: RuntimeClock, startedAtMs: number): number {
+  return Math.max(0, clock.now().getTime() - startedAtMs);
+}
+
+function classifyTransportError(error: unknown): string {
+  if (error instanceof Error && error.name.length > 0) {
+    return error.name;
+  }
+
+  return "unknown-transport-error";
 }
 
 async function publishCarrierWithConfirm(
@@ -492,6 +764,16 @@ async function publishCarrierWithConfirm(
       }
     );
   });
+}
+
+function assertPayloadRabbitMqTopology(
+  channel: ConfirmChannel,
+  routes: readonly WorkerRoute[]
+): Promise<void> {
+  // The runtime's narrow channel interface and amqplib's channel expose the
+  // same topology methods. Their consume-message header typings differ, but
+  // topology assertion does not use consumer messages.
+  return assertRabbitMqTopology(channel as unknown as RabbitMqConfirmChannel, routes);
 }
 
 function decodeCarrier(message: ConsumeMessage): PayloadCarrier {

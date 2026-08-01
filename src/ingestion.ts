@@ -13,7 +13,6 @@ import {
   emitRuntimeTelemetry,
   runtimeNow,
   type BrokerPublishCommand,
-  type PrometheusRuntimeTelemetrySink,
   type RuntimeHandlerResult,
   type RuntimeMessageContext,
   type RuntimeTelemetryOutcome,
@@ -43,13 +42,13 @@ import {
   type FetcherIdFactory
 } from "./ids.js";
 import { FetcherHttpError } from "./network.js";
+import { bestEffortTelemetrySink } from "./telemetry-safety.js";
 
 export interface FeedFetchWorkHandlerOptions {
   readonly config: FetcherConfig;
   readonly dependencies: FetcherDependencies;
   readonly idFactory?: FetcherIdFactory;
   readonly telemetry?: RuntimeTelemetrySink;
-  readonly metrics?: PrometheusRuntimeTelemetrySink;
 }
 
 interface FeedFetchRequest {
@@ -83,6 +82,42 @@ class FetcherPayloadValidationError extends Error {
   }
 }
 
+class FetcherUnsupportedCharsetError extends Error {
+  readonly charset: string;
+
+  constructor(charset: string, cause: unknown) {
+    super(`Feed response declares an unsupported charset: ${charset}.`, {
+      cause
+    });
+    this.name = "FetcherUnsupportedCharsetError";
+    this.charset = charset;
+  }
+}
+
+class FetcherInternalOperationError extends Error {
+  readonly operation: string;
+
+  constructor(operation: string, cause: unknown) {
+    super(`Internal fetcher operation failed: ${operation}.`, {
+      cause
+    });
+    this.name = "FetcherInternalOperationError";
+    this.operation = operation;
+  }
+}
+
+class FetcherSourceOperationError extends Error {
+  readonly operation: string;
+
+  constructor(operation: string, cause: unknown) {
+    super(`Feed source operation failed: ${operation}.`, {
+      cause
+    });
+    this.name = "FetcherSourceOperationError";
+    this.operation = operation;
+  }
+}
+
 const FETCH_QUEUE = getWorkerRoute("fetch").mainQueue.name;
 const DIAGNOSTIC_SAMPLE_BYTES = 256;
 const DEFAULT_MAX_ITEMS = 35;
@@ -90,10 +125,15 @@ const MAX_ITEMS = 500;
 
 export function createFeedFetchWorkHandler(options: FeedFetchWorkHandlerOptions): FetcherWorkHandler {
   const idFactory = options.idFactory ?? createCryptoFetcherIdFactory();
+  const telemetry = bestEffortTelemetrySink(options.telemetry);
+  const safeOptions = telemetry === undefined ? options : {
+    ...options,
+    telemetry
+  };
 
   return {
     name: "feed-fetch-work-handler",
-    handle: (context, tools) => handleFeedFetch(context, tools, options, idFactory)
+    handle: (context, tools) => handleFeedFetch(context, tools, safeOptions, idFactory)
   };
 }
 
@@ -109,7 +149,9 @@ async function handleFeedFetch(
 
   try {
     const feedUrl = new URL(request.feedUrl);
-    const dnsDecision = await options.dependencies.dnsPolicy.evaluate(feedUrl);
+    const dnsDecision = await runSourceOperation("resolve-feed-host", () =>
+      options.dependencies.dnsPolicy.evaluate(feedUrl)
+    );
 
     if (!dnsDecision.allowed) {
       const failure = permanentFailure("security", dnsDecision.reason, dnsDecision.reason);
@@ -119,19 +161,23 @@ async function handleFeedFetch(
       return resultFromFailure(failure);
     }
 
-    const metadata = await options.dependencies.stateStore.getFeedMetadata(request.feedId);
-    const response = await options.dependencies.httpClient.request({
-      url: feedUrl,
-      headers: conditionalHeaders(metadata),
-      userAgent: options.config.fetchPolicy.userAgent,
-      connectTimeoutMs: options.config.fetchPolicy.connectTimeoutMs,
-      readTimeoutMs: options.config.fetchPolicy.readTimeoutMs,
-      totalTimeoutMs: request.timeoutMs,
-      maxRedirects: options.config.fetchPolicy.maxRedirects,
-      maxResponseBytes: options.config.fetchPolicy.maxResponseBytes,
-      initialDnsDecision: dnsDecision,
-      redirectPolicy: options.dependencies.dnsPolicy
-    });
+    const metadata = await runInternalOperation("read-feed-metadata", () =>
+      options.dependencies.stateStore.getFeedMetadata(request.feedId)
+    );
+    const response = await runSourceOperation("retrieve-feed", () =>
+      options.dependencies.httpClient.request({
+        url: feedUrl,
+        headers: conditionalHeaders(metadata),
+        userAgent: options.config.fetchPolicy.userAgent,
+        connectTimeoutMs: options.config.fetchPolicy.connectTimeoutMs,
+        readTimeoutMs: options.config.fetchPolicy.readTimeoutMs,
+        totalTimeoutMs: request.timeoutMs,
+        maxRedirects: options.config.fetchPolicy.maxRedirects,
+        maxResponseBytes: options.config.fetchPolicy.maxResponseBytes,
+        initialDnsDecision: dnsDecision,
+        redirectPolicy: options.dependencies.dnsPolicy
+      })
+    );
 
     if (response.statusCode === 304) {
       await recordAndObserve(options, {
@@ -212,6 +258,66 @@ async function handleFeedFetch(
       createCanonicalizationPublishCommand(context, request, itemRef, idFactory, options.config, contentFingerprint, fetchedAt)
     );
 
+    for (const [index, itemRef] of itemRefs.entries()) {
+      const command = publishCommands[index];
+
+      if (command === undefined) {
+        throw new Error("Candidate publish command missing for item reference.");
+      }
+
+      const claim = await runInternalOperation("claim-candidate", () =>
+        options.dependencies.stateStore.claimCandidate(itemRef.candidateId, {
+          feedId: request.feedId,
+          sourceItemId: itemRef.sourceItemId,
+          contentFingerprint,
+          firstSeenAt: fetchedAt,
+          claimOwnerKey: command.envelope.messageId,
+          command
+        })
+      );
+
+      if (claim.status === "already-published") {
+        continue;
+      }
+
+      if (claim.status === "in-progress") {
+        return {
+          status: "retry",
+          reason: "candidate-publication-in-progress",
+          retryAfterMs: claim.retryAfterMs
+        };
+      }
+
+      try {
+        const receipt = await runInternalOperation("publish-candidate", () =>
+          tools.publish(claim.command)
+        );
+
+        await runInternalOperation("record-candidate-publication", () =>
+          options.dependencies.stateStore.markCandidatePublished(itemRef.candidateId, {
+            publishedAt: receipt.confirmedAt,
+            messageId: receipt.messageId,
+            idempotencyKey: claim.command.envelope.idempotencyKey,
+            claimOwnerKey: command.envelope.messageId
+          })
+        );
+      } catch (error: unknown) {
+        await runInternalOperation("record-candidate-publication-failure", () =>
+          options.dependencies.stateStore.markCandidatePublishFailed(itemRef.candidateId, {
+            failedAt: runtimeNow(options.dependencies.clock),
+            idempotencyKey: claim.command.envelope.idempotencyKey,
+            claimOwnerKey: command.envelope.messageId,
+            reason: error instanceof Error ? error.name : "CandidatePublishError"
+          })
+        );
+        throw error;
+      }
+    }
+
+    // Commit the fingerprint only after every candidate has a confirmed,
+    // durable publication record. A retry after partial fan-out can then
+    // revisit this body, skip already-published candidates, and publish the
+    // remainder instead of incorrectly treating the feed as unchanged.
     await recordAndObserve(options, {
       feedId: request.feedId,
       feedUrl: request.feedUrl,
@@ -224,32 +330,6 @@ async function handleFeedFetch(
       durationMs: response.durationMs,
       itemRefs
     }, "success");
-
-    for (const [index, itemRef] of itemRefs.entries()) {
-      const claim = await options.dependencies.stateStore.claimCandidate(itemRef.candidateId, {
-        feedId: request.feedId,
-        sourceItemId: itemRef.sourceItemId,
-        contentFingerprint,
-        firstSeenAt: fetchedAt
-      });
-
-      if (claim.status === "already-published") {
-        continue;
-      }
-
-      const command = publishCommands[index];
-
-      if (command === undefined) {
-        throw new Error("Candidate publish command missing for item reference.");
-      }
-
-      const receipt = await tools.publish(command);
-      await options.dependencies.stateStore.markCandidatePublished(itemRef.candidateId, {
-        publishedAt: runtimeNow(options.dependencies.clock),
-        messageId: receipt.messageId,
-        idempotencyKey: command.envelope.idempotencyKey
-      });
-    }
 
     return {
       status: "ok"
@@ -267,6 +347,10 @@ async function handleFetchError(
   durationMs: number
 ): Promise<RuntimeHandlerResult> {
   const failure = classifyFailure(error);
+
+  if (failure === undefined) {
+    throw error;
+  }
 
   await recordFailure(options, request, fetchedAt, durationMs, failure);
 
@@ -448,8 +532,9 @@ async function recordAndObserve(
   outcome: FetcherFetchOutcome,
   telemetryOutcome: RuntimeTelemetryOutcome
 ): Promise<void> {
-  await options.dependencies.stateStore.recordFetchOutcome(outcome);
-  options.metrics?.recordDependencyLatency(FETCH_QUEUE, outcome.durationMs, telemetryOutcome);
+  await runInternalOperation("record-feed-outcome", () =>
+    options.dependencies.stateStore.recordFetchOutcome(outcome)
+  );
   await emitRuntimeTelemetry(options.telemetry, {
     name: "runtime.dependency.observed",
     level: telemetryOutcome === "success" ? "info" : telemetryOutcome === "retry" ? "warn" : "error",
@@ -518,10 +603,17 @@ function isAcceptedContentType(contentType: string | undefined, accepted: readon
 
 function decodeBody(response: FetcherHttpResponse): string {
   const contentType = response.headers["content-type"];
-  const charset = contentType?.match(/charset=([^;]+)/iu)?.[1]?.trim();
-  const decoder = new TextDecoder(charset ?? "utf-8", {
-    fatal: false
-  });
+  const charsetMatch = contentType?.match(/(?:^|;)\s*charset\s*=\s*(?:"([^"]*)"|([^;\s]*))/iu);
+  const charset = (charsetMatch?.[1] ?? charsetMatch?.[2] ?? "utf-8").trim();
+  let decoder: TextDecoder;
+
+  try {
+    decoder = new TextDecoder(charset, {
+      fatal: false
+    });
+  } catch (error: unknown) {
+    throw new FetcherUnsupportedCharsetError(charset, error);
+  }
 
   return decoder.decode(response.body);
 }
@@ -597,7 +689,25 @@ function failureDetails(
   };
 }
 
-function classifyFailure(error: unknown): FetcherFailureDecision {
+function classifyFailure(error: unknown): FetcherFailureDecision | undefined {
+  if (error instanceof FetcherInternalOperationError) {
+    return undefined;
+  }
+
+  if (error instanceof FetcherSourceOperationError) {
+    return classifyKnownSourceFailure(error.cause)
+      ?? transientFailure("unknown", "unknown-fetch-error", errorName(error.cause));
+  }
+
+  return classifyKnownSourceFailure(error);
+}
+
+function classifyKnownSourceFailure(error: unknown): FetcherFailureDecision | undefined {
+
+  if (error instanceof FetcherUnsupportedCharsetError) {
+    return permanentFailure("content_type", "unsupported-charset", error.charset);
+  }
+
   if (error instanceof FeedParseError) {
     if (error.code === "malformed-xml") {
       return permanentFailure("malformed_xml", "malformed-xml", error.message);
@@ -628,7 +738,7 @@ function classifyFailure(error: unknown): FetcherFailureDecision {
     return permanentFailure("tls", "tls-failure", code);
   }
 
-  return transientFailure("unknown", "unknown-fetch-error", errorName(error));
+  return undefined;
 }
 
 function classifyFetcherHttpError(error: FetcherHttpError): FetcherFailureDecision {
@@ -773,6 +883,30 @@ function safeFeedUrl(value: string): string {
     return `${url.protocol}//${url.host}${path}${query}`;
   } catch {
     return diagnosticSample(value);
+  }
+}
+
+async function runInternalOperation<T>(operation: string, execute: () => Promise<T>): Promise<T> {
+  try {
+    return await execute();
+  } catch (error: unknown) {
+    if (error instanceof FetcherInternalOperationError) {
+      throw error;
+    }
+
+    throw new FetcherInternalOperationError(operation, error);
+  }
+}
+
+async function runSourceOperation<T>(operation: string, execute: () => T | Promise<T>): Promise<T> {
+  try {
+    return await execute();
+  } catch (error: unknown) {
+    if (error instanceof FetcherSourceOperationError) {
+      throw error;
+    }
+
+    throw new FetcherSourceOperationError(operation, error);
   }
 }
 

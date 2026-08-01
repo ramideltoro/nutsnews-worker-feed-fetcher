@@ -13,6 +13,17 @@ export interface FetcherDependencyProbe {
   readonly summary: string;
 }
 
+export type FetcherDependencyAdapterMode = "test" | "production" | "unknown";
+export type FetcherAggregateAdapterMode = "in_memory" | "mixed" | "production" | "unknown";
+
+export interface FetcherDependencyAdapterIdentity {
+  readonly stateStore: FetcherDependencyAdapterMode;
+  readonly httpClient: FetcherDependencyAdapterMode;
+  readonly dnsPolicy: FetcherDependencyAdapterMode;
+  readonly broker: FetcherDependencyAdapterMode;
+  readonly aggregate: FetcherAggregateAdapterMode;
+}
+
 export interface FetcherHttpRequest {
   readonly url: URL;
   readonly headers?: Readonly<Record<string, string>>;
@@ -37,6 +48,7 @@ export interface FetcherHttpResponse {
 
 export interface FetcherHttpClient {
   readonly name: string;
+  readonly adapterMode: FetcherDependencyAdapterMode;
   probe(): FetcherDependencyProbe | Promise<FetcherDependencyProbe>;
   request(request: FetcherHttpRequest): Promise<FetcherHttpResponse>;
 }
@@ -63,17 +75,31 @@ export interface FetcherResolvedAddress {
 
 export interface FetcherDnsPolicy {
   readonly name: string;
+  readonly adapterMode: FetcherDependencyAdapterMode;
   probe(): FetcherDependencyProbe | Promise<FetcherDependencyProbe>;
   evaluate(url: URL): FetcherDnsPolicyDecision | Promise<FetcherDnsPolicyDecision>;
 }
 
+export interface FetcherBrokerTransport extends RuntimeBrokerTransport {
+  readonly name: string;
+  readonly adapterMode: FetcherDependencyAdapterMode;
+}
+
+export type FetcherStateStoreMode = "local-memory" | "postgresql" | "unsupported";
+
 export interface FetcherDurableStateStore extends RuntimeIdempotencyStore {
   readonly name: string;
+  readonly mode: FetcherStateStoreMode;
+  readonly adapter: string;
+  readonly durable: boolean;
   probe(): FetcherDependencyProbe | Promise<FetcherDependencyProbe>;
   getFeedMetadata(feedId: string): Promise<FetcherFeedMetadata | undefined>;
   recordFetchOutcome(outcome: FetcherFetchOutcome): Promise<void>;
   claimCandidate(candidateId: string, claim: FetcherCandidateClaim): Promise<FetcherCandidateClaimResult>;
   markCandidatePublished(candidateId: string, publication: FetcherCandidatePublication): Promise<void>;
+  markCandidatePublishFailed(candidateId: string, failure: FetcherCandidatePublicationFailure): Promise<void>;
+  listPendingCandidatePublications(query: FetcherPendingPublicationQuery): Promise<readonly FetcherPendingCandidatePublication[]>;
+  close?(): Promise<void>;
 }
 
 export interface FetcherFeedMetadata {
@@ -151,22 +177,49 @@ export interface FetcherCandidateClaim {
   readonly sourceItemId: string;
   readonly contentFingerprint: string;
   readonly firstSeenAt: string;
+  readonly claimOwnerKey: string;
+  readonly command: BrokerPublishCommand;
 }
 
 export type FetcherCandidateClaimResult =
   | {
       readonly status: "claimed";
+      readonly command: BrokerPublishCommand;
     }
   | {
       readonly status: "already-published";
       readonly publishedAt: string;
       readonly messageId: string;
+    }
+  | {
+      readonly status: "in-progress";
+      readonly retryAfterMs: number;
     };
 
 export interface FetcherCandidatePublication {
   readonly publishedAt: string;
   readonly messageId: string;
   readonly idempotencyKey: string;
+  readonly claimOwnerKey: string;
+}
+
+export interface FetcherCandidatePublicationFailure {
+  readonly failedAt: string;
+  readonly idempotencyKey: string;
+  readonly claimOwnerKey: string;
+  readonly reason: string;
+}
+
+export interface FetcherPendingPublicationQuery {
+  readonly maxItems: number;
+  readonly minAgeSeconds: number;
+}
+
+export interface FetcherPendingCandidatePublication {
+  readonly candidateId: string;
+  readonly claimOwnerKey: string;
+  readonly command: BrokerPublishCommand;
+  readonly createdAt: string;
 }
 
 export interface FetcherWorkTools {
@@ -183,6 +236,47 @@ export interface FetcherDependencies {
   readonly httpClient: FetcherHttpClient;
   readonly dnsPolicy: FetcherDnsPolicy;
   readonly stateStore: FetcherDurableStateStore;
-  readonly brokerTransport: RuntimeBrokerTransport;
+  readonly brokerTransport: FetcherBrokerTransport;
   readonly workHandler: FetcherWorkHandler;
+}
+
+export function fetcherDependencyAdapterIdentity(dependencies: {
+  readonly stateStore: Pick<FetcherDurableStateStore, "mode" | "durable">;
+  readonly httpClient: Pick<FetcherHttpClient, "adapterMode">;
+  readonly dnsPolicy: Pick<FetcherDnsPolicy, "adapterMode">;
+  readonly brokerTransport: Pick<FetcherBrokerTransport, "adapterMode">;
+}): FetcherDependencyAdapterIdentity {
+  const modes = {
+    stateStore: stateStoreAdapterMode(dependencies.stateStore),
+    httpClient: dependencies.httpClient.adapterMode,
+    dnsPolicy: dependencies.dnsPolicy.adapterMode,
+    broker: dependencies.brokerTransport.adapterMode
+  };
+  const values = Object.values(modes);
+  const aggregate: FetcherAggregateAdapterMode = values.every((mode) => mode === "production")
+    ? "production"
+    : values.every((mode) => mode === "test")
+      ? "in_memory"
+      : values.every((mode) => mode === "unknown")
+        ? "unknown"
+        : "mixed";
+
+  return {
+    ...modes,
+    aggregate
+  };
+}
+
+function stateStoreAdapterMode(
+  stateStore: Pick<FetcherDurableStateStore, "mode" | "durable">
+): FetcherDependencyAdapterMode {
+  if (stateStore.mode === "postgresql" && stateStore.durable) {
+    return "production";
+  }
+
+  if (stateStore.mode === "local-memory" && !stateStore.durable) {
+    return "test";
+  }
+
+  return "unknown";
 }
