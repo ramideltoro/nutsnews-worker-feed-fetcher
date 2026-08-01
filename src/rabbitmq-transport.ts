@@ -11,7 +11,6 @@ import {
   createBrokerConsumerMonitor,
   createRetryEnvelope,
   emitRuntimeTelemetry,
-  assertRabbitMqTopology,
   randomUuidMessageIdFactory,
   runtimeNow,
   runtimeTraceHeadersFromEnvelope,
@@ -21,7 +20,6 @@ import {
   type BrokerDeliveryHandler,
   type BrokerPublishCommand,
   type BrokerPublishReceipt,
-  type RabbitMqConfirmChannel,
   type RuntimeClock,
   type RuntimeMessageProcessingResult,
   type RuntimeTelemetrySink
@@ -73,7 +71,6 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
   private channelOperation: Promise<ConfirmChannel> | undefined;
   private reconnectTimer: ReturnType<typeof setTimeout> | undefined;
   private reconnecting = false;
-  private routes: readonly WorkerRoute[] = [];
   private closing = false;
 
   constructor(options: {
@@ -112,14 +109,13 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
   }
 
   async assertTopology(routes: readonly WorkerRoute[]): Promise<void> {
-    const channelExists = this.channel !== undefined;
-
-    this.routes = routes;
-    const channel = await this.ensureChannel();
-
-    if (channelExists) {
-      await assertPayloadRabbitMqTopology(channel, routes);
-    }
+    // Production topology is provisioned by the protected backend RabbitMQ
+    // baseline. Stage identities intentionally have configure="^$", so the
+    // runtime must only connect, consume, and publish through that declared
+    // topology. Missing queues or exchanges still fail closed through the
+    // broker's consume/publish responses.
+    void routes;
+    await this.ensureChannel();
   }
 
   async publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
@@ -325,9 +321,6 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
     });
 
     try {
-      if (this.routes.length > 0) {
-        await assertPayloadRabbitMqTopology(channel, this.routes);
-      }
       await this.restoreConsumers(channel);
     } catch (error: unknown) {
       if (this.channel === channel) {
@@ -812,16 +805,6 @@ async function publishCarrierWithConfirm(
       fail(error instanceof Error ? error : new Error("RabbitMQ publish failed ambiguously."));
     }
   });
-}
-
-function assertPayloadRabbitMqTopology(
-  channel: ConfirmChannel,
-  routes: readonly WorkerRoute[]
-): Promise<void> {
-  // The runtime's narrow channel interface and amqplib's channel expose the
-  // same topology methods. Their consume-message header typings differ, but
-  // topology assertion does not use consumer messages.
-  return assertRabbitMqTopology(channel as unknown as RabbitMqConfirmChannel, routes);
 }
 
 function decodeCarrier(message: ConsumeMessage): PayloadCarrier {

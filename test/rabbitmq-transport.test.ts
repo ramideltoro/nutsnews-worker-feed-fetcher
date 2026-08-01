@@ -32,6 +32,7 @@ interface FakeBroker {
 }
 
 interface FakeBrokerOptions {
+  readonly assertExchange?: (exchange: string) => Promise<void>;
   readonly assertQueue?: (queue: string) => Promise<void>;
   readonly cancel?: (consumerTag: string) => Promise<void>;
   readonly publishBehavior?: "backpressure" | "callback-error" | "channel-close" | "channel-error" | "never-confirm" | "returned" | "sync-error";
@@ -123,7 +124,9 @@ describe("RabbitMQ payload transport", () => {
     expect(broker.connections[1]?.channel.prefetchCalls).toEqual([
       4
     ]);
-    expect(broker.connections[1]?.channel.assertedQueues).toContain("nutsnews.worker.fetch.v1");
+    expect(broker.connections[1]?.channel.assertedExchanges).toEqual([]);
+    expect(broker.connections[1]?.channel.assertedQueues).toEqual([]);
+    expect(broker.connections[1]?.channel.bindings).toEqual([]);
     expect(transport.consumerStatus("fetch")).toMatchObject({
       state: "active",
       activeConsumers: 1
@@ -173,8 +176,11 @@ describe("RabbitMQ payload transport", () => {
     await transport.close();
   });
 
-  it("asserts exchanges, queues, and bindings for input and output routes", async () => {
-    const broker = createFakeBroker();
+  it("uses protected pre-provisioned topology without configure operations", async () => {
+    const broker = createFakeBroker({
+      assertExchange: () => Promise.reject(new Error("configure permission denied")),
+      assertQueue: () => Promise.reject(new Error("configure permission denied"))
+    });
     const transport = new PayloadRabbitMqTransport({
       url: "amqp://fetcher:test@example.invalid:5672",
       prefetch: 4,
@@ -188,68 +194,24 @@ describe("RabbitMQ payload transport", () => {
       fetchRoute,
       canonicalizationRoute
     ]);
+    await transport.consume("fetch", () => Promise.resolve({
+      action: "dlq",
+      reason: "not-used"
+    }));
+    await transport.publish(createMinimalCanonicalizationCommand());
 
     const channel = broker.connections[0]?.channel;
 
-    expect(channel?.assertedExchanges).toEqual([
-      fetchRoute.exchange,
-      fetchRoute.retryExchange,
-      fetchRoute.dlqExchange
+    expect(channel?.assertedExchanges).toEqual([]);
+    expect(channel?.assertedQueues).toEqual([]);
+    expect(channel?.bindings).toEqual([]);
+    expect(channel?.consumeQueues).toEqual([fetchRoute.mainQueue.name]);
+    expect(channel?.publishes).toEqual([
+      expect.objectContaining({
+        exchange: canonicalizationRoute.exchange,
+        routingKey: canonicalizationRoute.routingKey
+      })
     ]);
-    expect(channel?.assertedQueues).toEqual(expect.arrayContaining([
-      fetchRoute.mainQueue.name,
-      ...fetchRoute.retryQueues.map((queue) => queue.name),
-      fetchRoute.terminalDlq.name,
-      canonicalizationRoute.mainQueue.name,
-      ...canonicalizationRoute.retryQueues.map((queue) => queue.name),
-      canonicalizationRoute.terminalDlq.name
-    ]));
-    expect(channel?.bindings).toContainEqual({
-      queue: canonicalizationRoute.mainQueue.name,
-      exchange: canonicalizationRoute.exchange,
-      routingKey: canonicalizationRoute.routingKey
-    });
-
-    await transport.close();
-  });
-
-  it("does not publish through a channel before topology initialization completes", async () => {
-    let releaseTopology!: () => void;
-    let markTopologyEntered!: () => void;
-    const topologyGate = new Promise<void>((resolve) => {
-      releaseTopology = resolve;
-    });
-    const topologyEntered = new Promise<void>((resolve) => {
-      markTopologyEntered = resolve;
-    });
-    const broker = createFakeBroker({
-      assertQueue: async () => {
-        markTopologyEntered();
-        await topologyGate;
-      }
-    });
-    const transport = new PayloadRabbitMqTransport({
-      url: "amqp://fetcher:test@example.invalid:5672",
-      prefetch: 4,
-      clock,
-      connect: broker.connect
-    });
-    const topology = transport.assertTopology([
-      getWorkerRoute("canonicalization")
-    ]);
-
-    await topologyEntered;
-    const publication = transport.publish(createMinimalCanonicalizationCommand());
-
-    await Promise.resolve();
-    expect(broker.connections[0]?.channel.publishes).toHaveLength(0);
-
-    releaseTopology();
-    await Promise.all([
-      topology,
-      publication
-    ]);
-    expect(broker.connections[0]?.channel.publishes).toHaveLength(1);
 
     await transport.close();
   });
@@ -558,9 +520,9 @@ function createFakeChannel(options: FakeBrokerOptions): FakeChannel {
   const consumers = new Map<string, (message: ConsumeMessage | null) => void>();
   const eventHandlers = new Map<string, Set<(...args: unknown[]) => void>>();
   const channel = {
-    assertExchange(exchange: string): Promise<void> {
+    async assertExchange(exchange: string): Promise<void> {
       assertedExchanges.push(exchange);
-      return Promise.resolve();
+      await options.assertExchange?.(exchange);
     },
     async assertQueue(queue: string): Promise<void> {
       assertedQueues.push(queue);
