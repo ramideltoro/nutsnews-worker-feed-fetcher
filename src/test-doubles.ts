@@ -4,45 +4,41 @@ import {
   WORKER_DELIVERY_BEHAVIOR,
   assertWorkerEnvelope,
   getWorkerRoute,
+  validateStagePayload,
   type WorkerMessageEnvelope,
   type WorkerRoute,
   type WorkerStage
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
-  createInMemoryIdempotencyStore,
   type BrokerConsumerHandle,
+  type BrokerConsumerStatus,
   type BrokerDeliveryHandler,
   type BrokerPublishCommand,
   type BrokerPublishReceipt,
-  type RuntimeBrokerTransport,
   type RuntimeClock,
   type RuntimeHandlerResult,
-  type RuntimeIdempotencyClaimContext,
-  type RuntimeIdempotencyClaimResult,
-  type RuntimeIdempotencyCompletion,
-  type RuntimeIdempotencyFailure,
   type RuntimeMessageContext,
   type RuntimeMessageDelivery,
   type RuntimeMessageProcessingResult
 } from "@ramideltoro/nutsnews-worker-runtime";
 
 import type {
+  FetcherBrokerTransport,
   FetcherDependencies,
-  FetcherCandidateClaim,
-  FetcherCandidateClaimResult,
-  FetcherCandidatePublication,
+  FetcherDependencyAdapterMode,
   FetcherDependencyProbe,
   FetcherDnsPolicy,
   FetcherDnsPolicyDecision,
   FetcherDurableStateStore,
-  FetcherFeedMetadata,
-  FetcherFetchOutcome,
   FetcherHttpClient,
   FetcherHttpRequest,
   FetcherHttpResponse,
   FetcherWorkTools,
   FetcherWorkHandler
 } from "./dependencies.js";
+import { InMemoryFetcherStateStore } from "./state-store.js";
+
+export { InMemoryFetcherStateStore };
 
 export class ManualFetcherClock implements RuntimeClock {
   private current: Date;
@@ -62,6 +58,7 @@ export class ManualFetcherClock implements RuntimeClock {
 
 export class LocalHttpClient implements FetcherHttpClient {
   readonly name: string = "local-http-client";
+  readonly adapterMode: FetcherDependencyAdapterMode;
   status: FetcherDependencyProbe["status"] = "ok";
   readonly requests: FetcherHttpRequest[] = [];
   response: FetcherHttpResponse = {
@@ -72,6 +69,10 @@ export class LocalHttpClient implements FetcherHttpClient {
     finalUrl: "https://feeds.example.test/world.xml",
     durationMs: 0
   };
+
+  constructor(adapterMode: FetcherDependencyAdapterMode = "test") {
+    this.adapterMode = adapterMode;
+  }
 
   probe(): FetcherDependencyProbe {
     return {
@@ -88,7 +89,12 @@ export class LocalHttpClient implements FetcherHttpClient {
 
 export class LocalDnsPolicy implements FetcherDnsPolicy {
   readonly name: string = "local-dns-policy";
+  readonly adapterMode: FetcherDependencyAdapterMode;
   status: FetcherDependencyProbe["status"] = "ok";
+
+  constructor(adapterMode: FetcherDependencyAdapterMode = "test") {
+    this.adapterMode = adapterMode;
+  }
 
   probe(): FetcherDependencyProbe {
     return {
@@ -133,86 +139,6 @@ export class LocalDnsPolicy implements FetcherDnsPolicy {
   }
 }
 
-export class InMemoryFetcherStateStore implements FetcherDurableStateStore {
-  readonly name: string = "local-durable-state";
-  status: FetcherDependencyProbe["status"] = "ok";
-  readonly outcomes: FetcherFetchOutcome[] = [];
-  private readonly feedMetadata = new Map<string, FetcherFeedMetadata>();
-  private readonly candidates = new Map<string, FetcherCandidatePublication>();
-  private readonly store;
-
-  constructor(clock: RuntimeClock = new ManualFetcherClock()) {
-    this.store = createInMemoryIdempotencyStore(clock);
-  }
-
-  probe(): FetcherDependencyProbe {
-    return {
-      status: this.status,
-      summary: this.status === "ok" ? "local durable state ready" : "local durable state degraded"
-    };
-  }
-
-  claim(idempotencyKey: string, context: RuntimeIdempotencyClaimContext): Promise<RuntimeIdempotencyClaimResult> {
-    return this.store.claim(idempotencyKey, context);
-  }
-
-  markCompleted(idempotencyKey: string, completion: RuntimeIdempotencyCompletion): Promise<void> {
-    return this.store.markCompleted(idempotencyKey, completion);
-  }
-
-  markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
-    return this.store.markFailed(idempotencyKey, failure);
-  }
-
-  getFeedMetadata(feedId: string): Promise<FetcherFeedMetadata | undefined> {
-    return Promise.resolve(this.feedMetadata.get(feedId));
-  }
-
-  recordFetchOutcome(outcome: FetcherFetchOutcome): Promise<void> {
-    this.outcomes.push(outcome);
-
-    if (outcome.fetchStatus === "success" || outcome.fetchStatus === "unchanged") {
-      this.feedMetadata.set(outcome.feedId, {
-        feedId: outcome.feedId,
-        ...(outcome.etag === undefined ? {} : {
-          etag: outcome.etag
-        }),
-        ...(outcome.lastModified === undefined ? {} : {
-          lastModified: outcome.lastModified
-        }),
-        ...(outcome.contentFingerprint === undefined ? {} : {
-          contentFingerprint: outcome.contentFingerprint
-        }),
-        fetchedAt: outcome.fetchedAt
-      });
-    }
-
-    return Promise.resolve();
-  }
-
-  claimCandidate(candidateId: string, claim: FetcherCandidateClaim): Promise<FetcherCandidateClaimResult> {
-    void claim;
-    const existing = this.candidates.get(candidateId);
-
-    if (existing !== undefined) {
-      return Promise.resolve({
-        status: "already-published",
-        publishedAt: existing.publishedAt,
-        messageId: existing.messageId
-      });
-    }
-
-    return Promise.resolve({
-      status: "claimed"
-    });
-  }
-
-  markCandidatePublished(candidateId: string, publication: FetcherCandidatePublication): Promise<void> {
-    this.candidates.set(candidateId, publication);
-    return Promise.resolve();
-  }
-}
-
 export class LocalFetcherWorkHandler implements FetcherWorkHandler {
   readonly name: string = "local-fetch-work-handler";
   readonly handled: RuntimeMessageContext[] = [];
@@ -232,17 +158,46 @@ export class LocalFetcherWorkHandler implements FetcherWorkHandler {
   }
 }
 
-export class LocalBrokerTransport implements RuntimeBrokerTransport {
+export class LocalBrokerTransport implements FetcherBrokerTransport {
   readonly name: string = "local-broker-transport";
+  readonly adapterMode: FetcherDependencyAdapterMode;
   readonly published: BrokerPublishCommand[] = [];
   readonly assertedRoutes: WorkerRoute[] = [];
   private readonly consumers = new Map<WorkerStage, BrokerDeliveryHandler>();
+  private readonly consumerStateListeners = new Set<() => void>();
   private deliveryCount = 0;
   private connected = false;
   private closed = false;
+  cancelGate: Promise<void> | undefined;
+  cancelCalls = 0;
+
+  constructor(adapterMode: FetcherDependencyAdapterMode = "test") {
+    this.adapterMode = adapterMode;
+  }
 
   get inFlightDeliveryCount(): number {
     return this.deliveryCount;
+  }
+
+  consumerStatus(stage: WorkerStage): BrokerConsumerStatus {
+    const active = this.consumers.has(stage);
+
+    return {
+      stage,
+      queue: getWorkerRoute(stage).mainQueue.name,
+      state: active ? "active" : "inactive",
+      activeConsumers: active ? 1 : 0,
+      reason: active ? "local-consumer-registered" : "local-consumer-inactive",
+      changedAt: new Date(0).toISOString()
+    };
+  }
+
+  onConsumerStateChange(listener: () => void): () => void {
+    this.consumerStateListeners.add(listener);
+
+    return () => {
+      this.consumerStateListeners.delete(listener);
+    };
   }
 
   connect(): Promise<void> {
@@ -280,12 +235,15 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
     }
 
     this.consumers.set(stage, handler);
+    this.notifyConsumerStateChange();
 
     return Promise.resolve({
       stage,
-      cancel: () => {
+      cancel: async () => {
+        this.cancelCalls += 1;
+        await this.cancelGate;
         this.consumers.delete(stage);
-        return Promise.resolve();
+        this.notifyConsumerStateChange();
       }
     });
   }
@@ -318,7 +276,19 @@ export class LocalBrokerTransport implements RuntimeBrokerTransport {
     this.closed = true;
     this.connected = false;
     this.consumers.clear();
+    this.notifyConsumerStateChange();
     return Promise.resolve();
+  }
+
+  simulateChannelDrop(stage: WorkerStage = "fetch"): void {
+    this.consumers.delete(stage);
+    this.notifyConsumerStateChange();
+  }
+
+  private notifyConsumerStateChange(): void {
+    for (const listener of this.consumerStateListeners) {
+      listener();
+    }
   }
 }
 
@@ -327,7 +297,7 @@ export interface LocalFetcherDependencyOptions {
   readonly httpClient?: FetcherHttpClient;
   readonly dnsPolicy?: FetcherDnsPolicy;
   readonly stateStore?: FetcherDurableStateStore;
-  readonly brokerTransport?: RuntimeBrokerTransport;
+  readonly brokerTransport?: FetcherBrokerTransport;
   readonly workHandler?: FetcherWorkHandler;
 }
 
@@ -417,5 +387,75 @@ export function createMinimalFetchDelivery(
     envelope: createMinimalFetchEnvelope(overrides.envelope ?? {}),
     payload: createMinimalFetchPayload(overrides.payload),
     receivedAt: "2026-07-23T00:00:01.000Z"
+  };
+}
+
+export function createMinimalCanonicalizationCommand(overrides: {
+  readonly candidateId?: string;
+  readonly messageId?: string;
+  readonly idempotencyKey?: string;
+} = {}): BrokerPublishCommand {
+  const route = getWorkerRoute("canonicalization");
+  const now = "2026-07-23T00:00:00.000Z";
+  const candidateId = overrides.candidateId ?? "candidate-world-one";
+  const messageId = overrides.messageId ?? "018f1598-2dd5-7c4f-9f92-8f7a7f8b3630";
+  const idempotencyKey = overrides.idempotencyKey ?? `fetcher:canonicalization:${candidateId}:fingerprint-v1`;
+  const payload = {
+    schemaId: STAGE_PAYLOAD_SCHEMA_IDS.canonicalArticleCandidate,
+    schemaVersion: STAGE_PAYLOAD_SCHEMA_VERSION,
+    pipelineRunId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3601",
+    stageExecutionId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3631",
+    sourceMessageId: "018f1598-2dd5-7c4f-9f92-8f7a7f8b3620",
+    idempotencyKey,
+    traceparent: "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+    producedAt: now,
+    candidateId,
+    feedId: "feed-world",
+    sourceItemId: "guid-001",
+    originalUrl: "https://articles.example.test/world/story-one",
+    canonicalUrl: "https://articles.example.test/world/story-one",
+    title: "Story One",
+    sourceName: "World Source",
+    dedupeStatus: "new"
+  } as const;
+
+  if (!validateStagePayload(payload).ok) {
+    throw new Error("Minimal canonicalization command fixture is invalid.");
+  }
+
+  return {
+    envelope: assertWorkerEnvelope({
+      schemaId: route.schemaId,
+      schemaVersion: 1,
+      route: "canonicalization",
+      messageId,
+      causationId: payload.sourceMessageId,
+      correlationId: payload.pipelineRunId,
+      traceparent: payload.traceparent,
+      idempotencyKey,
+      aggregate: {
+        type: "candidate",
+        id: candidateId,
+        version: 1
+      },
+      occurredAt: now,
+      attempt: {
+        count: 1,
+        max: WORKER_DELIVERY_BEHAVIOR.maxAttempts,
+        firstAttemptAt: now
+      },
+      producer: {
+        name: "fetcher",
+        version: "0.1.0",
+        instanceId: "fetcher-test"
+      },
+      payloadRef: {
+        kind: "backend-record",
+        uri: `backend://worker-uplift/feed-fetcher/feed-world/${candidateId}`,
+        mediaType: "application/json",
+        sizeBytes: Buffer.byteLength(JSON.stringify(payload), "utf8")
+      }
+    }),
+    payload
   };
 }

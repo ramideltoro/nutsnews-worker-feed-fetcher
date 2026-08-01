@@ -34,6 +34,7 @@ export class FetcherHttpError extends Error {
 
 export class NodeFetcherHttpClient implements FetcherHttpClient {
   readonly name: string = "node-fetch-http-client";
+  readonly adapterMode = "production" as const;
 
   probe(): FetcherDependencyProbe {
     return {
@@ -136,6 +137,7 @@ export class NodeFetcherHttpClient implements FetcherHttpClient {
 
 export class DefaultFetcherDnsPolicy implements FetcherDnsPolicy {
   readonly name: string = "default-dns-policy";
+  readonly adapterMode = "production" as const;
 
   probe(): FetcherDependencyProbe {
     return {

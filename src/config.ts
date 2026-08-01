@@ -1,9 +1,15 @@
 import os from "node:os";
 
+import { WORKER_DELIVERY_BEHAVIOR } from "@ramideltoro/nutsnews-worker-contracts";
+
+import { FETCHER_MAX_CLAIM_LEASE_MS } from "./dependencies.js";
+
 export const FETCHER_SERVICE_NAME = "nutsnews-worker-feed-fetcher" as const;
 export const FETCHER_SERVICE_VERSION = "0.1.0" as const;
+export const FETCHER_CLAIM_SETTLEMENT_SAFETY_MS = 5_000 as const;
 
 export type FetcherDependencyMode = "test" | "production";
+export type FetcherDeploymentMode = "shadow" | "production";
 export type FetcherTelemetryLogMode = "stdout" | "silent";
 
 export interface FetcherConfigVariable {
@@ -21,10 +27,15 @@ export const FETCHER_CONFIG_SCHEMA = [
   variable("NUTSNEWS_FETCHER_DEPENDENCY_MODE", "Use test dependencies locally or require production dependency presence.", false, false, "test"),
   variable("NUTSNEWS_FETCHER_DATABASE_URL", "Backend shadow database connection string for durable fetch state.", true, true),
   variable("NUTSNEWS_FETCHER_RABBITMQ_URL", "Private RabbitMQ connection string.", true, true),
+  variable("NUTSNEWS_FETCHER_DATABASE_POOL_MAX", "Maximum PostgreSQL connections owned by this fetcher instance.", false, false, "10"),
+  variable("NUTSNEWS_FETCHER_DATABASE_TIMEOUT_MS", "PostgreSQL connect, query, and statement timeout in milliseconds.", false, false, "5000"),
+  variable("NUTSNEWS_FETCHER_IDEMPOTENCY_LEASE_MS", "Crash-recovery lease for inbox and pending candidate publication ownership (maximum five minutes).", false, false, "300000"),
   variable("NUTSNEWS_FETCHER_CONCURRENCY", "Maximum concurrent feed-fetch message handlers.", false, false, "8"),
-  variable("NUTSNEWS_FETCHER_PREFETCH", "Broker prefetch bound for feed-fetch deliveries.", false, false, "16"),
+  variable("NUTSNEWS_FETCHER_PREFETCH", "Broker prefetch bound for feed-fetch deliveries.", false, false, "8"),
+  variable("NUTSNEWS_FETCHER_STARTUP_TIMEOUT_MS", "Maximum duration for a dependency startup probe before the worker fails closed.", false, false, "30000"),
   variable("NUTSNEWS_FETCHER_SHUTDOWN_TIMEOUT_MS", "Graceful shutdown drain timeout in milliseconds.", false, false, "30000"),
   variable("NUTSNEWS_FETCHER_SHADOW_MODE", "Keep fetcher output isolated from legacy ingestion.", false, false, "true"),
+  variable("NUTSNEWS_FETCHER_BUILD_REVISION", "Immutable source revision embedded in the service image.", false, false, "unknown"),
   variable("NUTSNEWS_FETCHER_TELEMETRY_LOGS", "Structured runtime log sink mode.", false, false, "stdout"),
   variable("NUTSNEWS_FETCHER_METRICS_ENABLED", "Expose bounded Prometheus metrics.", false, false, "true"),
   variable("NUTSNEWS_FETCHER_USER_AGENT", "HTTP user agent for feed requests.", false, false, "NutsNewsWorkerFetcher/0.1"),
@@ -47,12 +58,21 @@ export interface FetcherConfig {
     readonly port: number;
   };
   readonly dependencyMode: FetcherDependencyMode;
+  readonly deploymentMode: FetcherDeploymentMode;
+  readonly expectedActive: boolean;
+  readonly buildRevision: string;
   readonly dependencies: {
     readonly databaseConfigured: boolean;
     readonly rabbitmqConfigured: boolean;
   };
+  readonly database: {
+    readonly poolMax: number;
+    readonly timeoutMs: number;
+    readonly idempotencyLeaseMs: number;
+  };
   readonly concurrency: number;
   readonly prefetch: number;
+  readonly startupTimeoutMs: number;
   readonly shutdownTimeoutMs: number;
   readonly shadowMode: boolean;
   readonly telemetryLogs: FetcherTelemetryLogMode;
@@ -93,25 +113,43 @@ export function loadFetcherConfig(env: NodeJS.ProcessEnv = process.env): Fetcher
   }
 
   const concurrency = parseInteger(env.NUTSNEWS_FETCHER_CONCURRENCY, "NUTSNEWS_FETCHER_CONCURRENCY", 8, 1, 128, issues);
-  const prefetch = parseInteger(env.NUTSNEWS_FETCHER_PREFETCH, "NUTSNEWS_FETCHER_PREFETCH", 16, 1, 512, issues);
+  const prefetch = parseInteger(env.NUTSNEWS_FETCHER_PREFETCH, "NUTSNEWS_FETCHER_PREFETCH", 8, 1, 512, issues);
   const connectTimeoutMs = parseInteger(env.NUTSNEWS_FETCHER_CONNECT_TIMEOUT_MS, "NUTSNEWS_FETCHER_CONNECT_TIMEOUT_MS", 5_000, 250, 60_000, issues);
   const readTimeoutMs = parseInteger(env.NUTSNEWS_FETCHER_READ_TIMEOUT_MS, "NUTSNEWS_FETCHER_READ_TIMEOUT_MS", 10_000, 250, 120_000, issues);
   const totalTimeoutMs = parseInteger(env.NUTSNEWS_FETCHER_TOTAL_TIMEOUT_MS, "NUTSNEWS_FETCHER_TOTAL_TIMEOUT_MS", 15_000, 250, 180_000, issues);
+  const shadowMode = parseBoolean(env.NUTSNEWS_FETCHER_SHADOW_MODE, "NUTSNEWS_FETCHER_SHADOW_MODE", true, issues);
+  const environment = nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local");
   const config: FetcherConfig = {
     serviceName: FETCHER_SERVICE_NAME,
     serviceVersion: FETCHER_SERVICE_VERSION,
-    environment: nonEmpty(env.NUTSNEWS_ENVIRONMENT, "local"),
+    environment,
     host: nonEmpty(env.HOSTNAME, os.hostname()),
     http: {
       host: nonEmpty(env.NUTSNEWS_FETCHER_HTTP_HOST, "0.0.0.0"),
       port: parseInteger(env.NUTSNEWS_FETCHER_HTTP_PORT, "NUTSNEWS_FETCHER_HTTP_PORT", 8080, 0, 65_535, issues)
     },
     dependencyMode,
+    deploymentMode: shadowMode ? "shadow" : "production",
+    expectedActive: !shadowMode,
+    buildRevision: parseBuildRevision(env.NUTSNEWS_FETCHER_BUILD_REVISION, issues),
     dependencies,
+    database: {
+      poolMax: parseInteger(env.NUTSNEWS_FETCHER_DATABASE_POOL_MAX, "NUTSNEWS_FETCHER_DATABASE_POOL_MAX", 10, 1, 64, issues),
+      timeoutMs: parseInteger(env.NUTSNEWS_FETCHER_DATABASE_TIMEOUT_MS, "NUTSNEWS_FETCHER_DATABASE_TIMEOUT_MS", 5_000, 100, 60_000, issues),
+      idempotencyLeaseMs: parseInteger(
+        env.NUTSNEWS_FETCHER_IDEMPOTENCY_LEASE_MS,
+        "NUTSNEWS_FETCHER_IDEMPOTENCY_LEASE_MS",
+        FETCHER_MAX_CLAIM_LEASE_MS,
+        60_000,
+        FETCHER_MAX_CLAIM_LEASE_MS,
+        issues
+      )
+    },
     concurrency,
     prefetch,
+    startupTimeoutMs: parseInteger(env.NUTSNEWS_FETCHER_STARTUP_TIMEOUT_MS, "NUTSNEWS_FETCHER_STARTUP_TIMEOUT_MS", 30_000, 100, 600_000, issues),
     shutdownTimeoutMs: parseInteger(env.NUTSNEWS_FETCHER_SHUTDOWN_TIMEOUT_MS, "NUTSNEWS_FETCHER_SHUTDOWN_TIMEOUT_MS", 30_000, 1_000, 600_000, issues),
-    shadowMode: parseBoolean(env.NUTSNEWS_FETCHER_SHADOW_MODE, "NUTSNEWS_FETCHER_SHADOW_MODE", true, issues),
+    shadowMode,
     telemetryLogs: parseTelemetryLogMode(env.NUTSNEWS_FETCHER_TELEMETRY_LOGS, issues),
     metricsEnabled: parseBoolean(env.NUTSNEWS_FETCHER_METRICS_ENABLED, "NUTSNEWS_FETCHER_METRICS_ENABLED", true, issues),
     fetchPolicy: {
@@ -130,6 +168,11 @@ export function loadFetcherConfig(env: NodeJS.ProcessEnv = process.env): Fetcher
     issues.push("NUTSNEWS_FETCHER_PREFETCH must be greater than or equal to NUTSNEWS_FETCHER_CONCURRENCY.");
   }
 
+  if ((config.environment.toLowerCase() === "production" || config.environment.toLowerCase() === "prod")
+    && config.dependencyMode !== "production") {
+    issues.push("NUTSNEWS_FETCHER_DEPENDENCY_MODE must be production when NUTSNEWS_ENVIRONMENT is production or prod.");
+  }
+
   if (config.fetchPolicy.connectTimeoutMs > config.fetchPolicy.totalTimeoutMs) {
     issues.push("NUTSNEWS_FETCHER_CONNECT_TIMEOUT_MS must be less than or equal to NUTSNEWS_FETCHER_TOTAL_TIMEOUT_MS.");
   }
@@ -140,6 +183,33 @@ export function loadFetcherConfig(env: NodeJS.ProcessEnv = process.env): Fetcher
 
   if (!config.shadowMode) {
     issues.push("NUTSNEWS_FETCHER_SHADOW_MODE must remain true until backend-owned deployment enables cutover.");
+  }
+
+  if (config.dependencyMode === "production" && config.buildRevision.toLowerCase() === "unknown") {
+    issues.push("NUTSNEWS_FETCHER_BUILD_REVISION must be an immutable non-unknown revision in production dependency mode.");
+  }
+
+  if (config.dependencyMode === "production" && config.database.timeoutMs > config.startupTimeoutMs) {
+    issues.push("NUTSNEWS_FETCHER_DATABASE_TIMEOUT_MS must be less than or equal to NUTSNEWS_FETCHER_STARTUP_TIMEOUT_MS.");
+  }
+
+  const candidateSettlementDeadlineMs = config.database.timeoutMs
+    + WORKER_DELIVERY_BEHAVIOR.confirmTimeoutMs
+    + FETCHER_CLAIM_SETTLEMENT_SAFETY_MS;
+  const sourceCheckpointDeadlineMs = config.fetchPolicy.totalTimeoutMs
+    + config.database.timeoutMs
+    + FETCHER_CLAIM_SETTLEMENT_SAFETY_MS;
+
+  if (config.database.idempotencyLeaseMs < candidateSettlementDeadlineMs) {
+    issues.push(
+      "NUTSNEWS_FETCHER_IDEMPOTENCY_LEASE_MS must cover the PostgreSQL timeout, RabbitMQ confirm timeout, and 5000ms settlement safety margin."
+    );
+  }
+
+  if (config.database.idempotencyLeaseMs < sourceCheckpointDeadlineMs) {
+    issues.push(
+      "NUTSNEWS_FETCHER_IDEMPOTENCY_LEASE_MS must cover the total feed timeout, PostgreSQL checkpoint timeout, and 5000ms settlement safety margin."
+    );
   }
 
   if (issues.length > 0) {
@@ -201,6 +271,17 @@ function parseTelemetryLogMode(value: string | undefined, issues: string[]): Fet
 
   issues.push("NUTSNEWS_FETCHER_TELEMETRY_LOGS must be stdout or silent.");
   return "stdout";
+}
+
+function parseBuildRevision(value: string | undefined, issues: string[]): string {
+  const revision = nonEmpty(value, "unknown");
+
+  if (/^[a-zA-Z0-9][a-zA-Z0-9._-]{0,127}$/u.test(revision)) {
+    return revision;
+  }
+
+  issues.push("NUTSNEWS_FETCHER_BUILD_REVISION must be 1-128 characters using letters, numbers, dot, underscore, or hyphen.");
+  return "unknown";
 }
 
 function parseBoolean(
