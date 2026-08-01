@@ -466,7 +466,10 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
     await withTransaction(this.#pool, async (client) => {
       await client.query(
         "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        [`${outcome.feedId}\u0000${outcome.feedUrl}`]
+        [JSON.stringify([
+          outcome.feedId,
+          outcome.feedUrl
+        ])]
       );
 
       await client.query(
