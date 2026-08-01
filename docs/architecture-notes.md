@@ -20,7 +20,7 @@ The feed fetcher owns the worker-uplift service boundary that consumes `feedFetc
 2. Assert exact contracts/runtime package versions.
 3. Bind diagnostic HTTP and install shutdown handling before dependency initialization.
 4. Probe the state store within `NUTSNEWS_FETCHER_STARTUP_TIMEOUT_MS`; remain fail-closed without broker consumption when it is unhealthy, fails, or times out.
-5. Start the shared broker lifecycle, assert fetch/canonicalization topology, and register a `fetch` consumer through the shared runtime message processor.
+5. Start the shared broker lifecycle against the protected backend's pre-provisioned fetch/canonicalization topology, perform no runtime configure operation, and register a `fetch` consumer through the shared runtime message processor.
 6. Validate incoming envelopes and feed-fetch payloads before any handler work.
 7. Claim the durable idempotency interface before delegating to the injected handler.
 8. Evaluate DNS policy and reject unsupported protocols, localhost, loopback, link-local, metadata, private literal addresses, and protected resolved addresses.
@@ -46,6 +46,8 @@ The repository defines narrow interfaces for:
 - fetch work handler.
 
 Local doubles back tests and health probes without production dependencies. Backend-owned deployment configuration supplies database and RabbitMQ values; configuration presence alone does not satisfy readiness.
+
+RabbitMQ exchanges, queues, bindings, retry tiers, and DLQs are declared only by the protected backend baseline. The runtime stage identity retains `configure="^$"` and uses its bounded read/write permissions only. A missing queue fails consumer registration, and a missing or unroutable exchange fails the mandatory publisher-confirm path; neither condition causes the service to widen privileges or create topology.
 
 Production mode constructs a bounded PostgreSQL pool from the protected runtime URL and probes backend-owned `worker_uplift_fetcher.state_contract` version 2 plus every required table, claim-token index, and validated five-minute lease constraint before broker consumption. It also requires production identities from the HTTP, DNS, RabbitMQ, and state-store adapters; a mixed or unknown set keeps consumption disabled and is exported truthfully. A missing URL at adapter construction selects an explicit `unsupported` store. A missing, stale, or unhealthy contract keeps consumption disabled; liveness, startup, and metrics remain available. Test mode alone may use the `local-memory` adapter.
 
