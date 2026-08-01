@@ -71,7 +71,8 @@ export const FETCHER_STAGE_METRIC_OUTCOMES = [
   "duplicate",
   "invalid",
   "retry",
-  "dlq"
+  "dlq",
+  "failure"
 ] as const;
 
 export type FetcherStageMetricOutcome = (typeof FETCHER_STAGE_METRIC_OUTCOMES)[number];
@@ -623,7 +624,10 @@ function fetcherStageOutcome(
 
   switch (event.name) {
     case "runtime.message.accepted":
-      return "success";
+      // Accepted is the success event in both supported Runtime generations,
+      // but retain an explicitly reported terminal failure as the shared
+      // lifecycle contract's bounded fallback rather than misclassifying it.
+      return event.outcome === "failure" ? "failure" : "success";
     case "runtime.message.duplicate":
       return "duplicate";
     case "runtime.message.invalid":

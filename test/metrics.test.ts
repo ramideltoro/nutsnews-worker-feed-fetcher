@@ -35,7 +35,7 @@ describe("fetcher Prometheus metrics", () => {
     const initialOutput = metrics.collect();
     const initialSeries = canonicalStageSeriesKeys(initialOutput);
 
-    expect(initialSeries).toHaveLength(21);
+    expect(initialSeries).toHaveLength(22);
 
     for (const outcome of FETCHER_STAGE_METRIC_OUTCOMES) {
       expect(initialOutput).toContain(`nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="${outcome}"} 0`);
@@ -317,7 +317,8 @@ describe("fetcher Prometheus metrics", () => {
       ["runtime.message.duplicate", "duplicate", 50],
       ["runtime.message.invalid", "failure", 250],
       ["runtime.message.retry", "retry", 10_000],
-      ["runtime.message.dlq", "dlq", 30_001]
+      ["runtime.message.dlq", "dlq", 30_001],
+      ["runtime.message.accepted", "failure", 40_000]
     ] as const;
 
     for (const [name, outcome, durationMs] of completions) {
@@ -357,7 +358,8 @@ describe("fetcher Prometheus metrics", () => {
       "duplicate",
       "invalid",
       "retry",
-      "dlq"
+      "dlq",
+      "failure"
     ]);
     expect(FETCHER_STAGE_LATENCY_BUCKETS_SECONDS).toContain(30);
     expect(output).toContain('nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="success"} 1');
@@ -365,18 +367,20 @@ describe("fetcher Prometheus metrics", () => {
     expect(output).toContain('nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="invalid"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="retry"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="dlq"} 2');
+    expect(output).toContain('nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="failure"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="0.01"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="0.05"} 2');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="0.25"} 3');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="10"} 4');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="30"} 4');
-    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="60"} 5');
-    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="+Inf"} 5');
-    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_sum{environment="local",service="fetch"} 40.306');
-    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_count{environment="local",service="fetch"} 5');
+    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="60"} 6');
+    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="+Inf"} 6');
+    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_sum{environment="local",service="fetch"} 80.306');
+    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_count{environment="local",service="fetch"} 6');
     expect(output).toContain('# TYPE nutsnews_worker_processing_duration_seconds histogram');
     expect(output).toMatch(/nutsnews_worker_processing_duration_seconds_count\{[^\n]+outcome="success"\} 1/u);
     expect(output).toMatch(/nutsnews_worker_processing_duration_seconds_sum\{[^\n]+outcome="dlq"\} 30\.001/u);
+    expect(output).toMatch(/nutsnews_worker_processing_duration_seconds_sum\{[^\n]+outcome="failure"\} 40/u);
     expect(output).not.toContain("_duration_ms");
     expect(output).not.toMatch(/^# TYPE .* summary$/mu);
 
@@ -384,7 +388,7 @@ describe("fetcher Prometheus metrics", () => {
       line.startsWith("nutsnews_worker_uplift_stage_events_total{")
     );
 
-    expect(lifecycleSeries).toHaveLength(5);
+    expect(lifecycleSeries).toHaveLength(6);
   });
 });
 
