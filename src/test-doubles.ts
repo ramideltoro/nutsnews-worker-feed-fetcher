@@ -11,6 +11,7 @@ import {
 } from "@ramideltoro/nutsnews-worker-contracts";
 import {
   type BrokerConsumerHandle,
+  type BrokerConsumerStatus,
   type BrokerDeliveryHandler,
   type BrokerPublishCommand,
   type BrokerPublishReceipt,
@@ -163,6 +164,7 @@ export class LocalBrokerTransport implements FetcherBrokerTransport {
   readonly published: BrokerPublishCommand[] = [];
   readonly assertedRoutes: WorkerRoute[] = [];
   private readonly consumers = new Map<WorkerStage, BrokerDeliveryHandler>();
+  private readonly consumerStateListeners = new Set<() => void>();
   private deliveryCount = 0;
   private connected = false;
   private closed = false;
@@ -175,6 +177,27 @@ export class LocalBrokerTransport implements FetcherBrokerTransport {
 
   get inFlightDeliveryCount(): number {
     return this.deliveryCount;
+  }
+
+  consumerStatus(stage: WorkerStage): BrokerConsumerStatus {
+    const active = this.consumers.has(stage);
+
+    return {
+      stage,
+      queue: getWorkerRoute(stage).mainQueue.name,
+      state: active ? "active" : "inactive",
+      activeConsumers: active ? 1 : 0,
+      reason: active ? "local-consumer-registered" : "local-consumer-inactive",
+      changedAt: new Date(0).toISOString()
+    };
+  }
+
+  onConsumerStateChange(listener: () => void): () => void {
+    this.consumerStateListeners.add(listener);
+
+    return () => {
+      this.consumerStateListeners.delete(listener);
+    };
   }
 
   connect(): Promise<void> {
@@ -212,6 +235,7 @@ export class LocalBrokerTransport implements FetcherBrokerTransport {
     }
 
     this.consumers.set(stage, handler);
+    this.notifyConsumerStateChange();
 
     return Promise.resolve({
       stage,
@@ -219,6 +243,7 @@ export class LocalBrokerTransport implements FetcherBrokerTransport {
         this.cancelCalls += 1;
         await this.cancelGate;
         this.consumers.delete(stage);
+        this.notifyConsumerStateChange();
       }
     });
   }
@@ -251,7 +276,19 @@ export class LocalBrokerTransport implements FetcherBrokerTransport {
     this.closed = true;
     this.connected = false;
     this.consumers.clear();
+    this.notifyConsumerStateChange();
     return Promise.resolve();
+  }
+
+  simulateChannelDrop(stage: WorkerStage = "fetch"): void {
+    this.consumers.delete(stage);
+    this.notifyConsumerStateChange();
+  }
+
+  private notifyConsumerStateChange(): void {
+    for (const listener of this.consumerStateListeners) {
+      listener();
+    }
   }
 }
 
