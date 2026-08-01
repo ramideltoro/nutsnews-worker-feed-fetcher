@@ -30,6 +30,7 @@ import type {
   FetcherWorkHandler,
   FetcherWorkTools
 } from "./dependencies.js";
+import { isFetcherDefinitePublishError } from "./dependencies.js";
 import {
   FeedParseError,
   parseFeedXml,
@@ -271,7 +272,6 @@ async function handleFeedFetch(
           sourceItemId: itemRef.sourceItemId,
           contentFingerprint,
           firstSeenAt: fetchedAt,
-          claimOwnerKey: command.envelope.messageId,
           command
         })
       );
@@ -288,30 +288,40 @@ async function handleFeedFetch(
         };
       }
 
+      let receipt: Awaited<ReturnType<FetcherWorkTools["publish"]>>;
+
       try {
-        const receipt = await runInternalOperation("publish-candidate", () =>
+        receipt = await runInternalOperation("publish-candidate", () =>
           tools.publish(claim.command)
         );
-
-        await runInternalOperation("record-candidate-publication", () =>
-          options.dependencies.stateStore.markCandidatePublished(itemRef.candidateId, {
-            publishedAt: receipt.confirmedAt,
-            messageId: receipt.messageId,
-            idempotencyKey: claim.command.envelope.idempotencyKey,
-            claimOwnerKey: command.envelope.messageId
-          })
-        );
       } catch (error: unknown) {
-        await runInternalOperation("record-candidate-publication-failure", () =>
-          options.dependencies.stateStore.markCandidatePublishFailed(itemRef.candidateId, {
-            failedAt: runtimeNow(options.dependencies.clock),
-            idempotencyKey: claim.command.envelope.idempotencyKey,
-            claimOwnerKey: command.envelope.messageId,
-            reason: error instanceof Error ? error.name : "CandidatePublishError"
-          })
-        );
+        if (isFetcherDefinitePublishError(error)) {
+          await runInternalOperation("record-candidate-publication-failure", () =>
+            options.dependencies.stateStore.markCandidatePublishFailed(itemRef.candidateId, {
+              failedAt: runtimeNow(options.dependencies.clock),
+              idempotencyKey: claim.command.envelope.idempotencyKey,
+              claimToken: claim.claimToken,
+              reason: error instanceof Error ? error.name : "CandidatePublishError"
+            })
+          );
+        }
+
+        // Unknown publish outcomes can already have reached the queue. Retain
+        // the fenced lease so redelivery cannot immediately duplicate them.
         throw error;
       }
+
+      // Keep finalization outside the publish catch. A confirmed publish whose
+      // database response is lost is ambiguous and must never be reclassified
+      // as an immediately retryable broker failure.
+      await runInternalOperation("record-candidate-publication", () =>
+        options.dependencies.stateStore.markCandidatePublished(itemRef.candidateId, {
+          publishedAt: receipt.confirmedAt,
+          messageId: receipt.messageId,
+          idempotencyKey: claim.command.envelope.idempotencyKey,
+          claimToken: claim.claimToken
+        })
+      );
     }
 
     // Commit the fingerprint only after every candidate has a confirmed,

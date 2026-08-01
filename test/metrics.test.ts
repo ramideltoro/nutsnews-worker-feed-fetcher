@@ -3,10 +3,10 @@ import {
   expect,
   it
 } from "vitest";
+import { RUNTIME_DURATION_HISTOGRAM_BUCKETS_SECONDS } from "@ramideltoro/nutsnews-worker-runtime";
 
 import { loadFetcherConfig } from "../src/config.js";
 import {
-  FETCHER_DURATION_HISTOGRAM_BUCKETS_SECONDS,
   FETCHER_METRIC_DEPENDENCIES,
   FETCHER_METRIC_LABELS,
   FETCHER_STAGE_LATENCY_BUCKETS_SECONDS,
@@ -35,7 +35,7 @@ describe("fetcher Prometheus metrics", () => {
     const initialOutput = metrics.collect();
     const initialSeries = canonicalStageSeriesKeys(initialOutput);
 
-    expect(initialSeries).toHaveLength(22);
+    expect(initialSeries).toHaveLength(24);
 
     for (const outcome of FETCHER_STAGE_METRIC_OUTCOMES) {
       expect(initialOutput).toContain(`nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="${outcome}"} 0`);
@@ -106,16 +106,47 @@ describe("fetcher Prometheus metrics", () => {
       outcome: "success"
     });
 
+    for (const probe of ["liveness", "startup", "readiness"] as const) {
+      await metrics.emit({
+        name: "runtime.health.evaluated",
+        level: probe === "liveness" ? "info" : "warn",
+        at: "2026-07-23T00:06:00.000Z",
+        outcome: probe === "liveness" ? "ok" : "unhealthy",
+        attributes: {
+          probe,
+          checks: [{
+            name: probe === "liveness"
+              ? "process"
+              : probe === "startup"
+                ? "service-started"
+                : "rabbitmq-consumer",
+            status: probe === "liveness" ? "ok" : "unhealthy",
+            critical: true,
+            durationMs: 1
+          }]
+        }
+      });
+    }
+
     const output = metrics.collect();
 
-    expect(output).toContain('nutsnews_worker_build_info{environment="local",revision="501ededcad48924b632b0547679f4dcb54ed4a90",service="nutsnews-worker-feed-fetcher",version="0.1.0"} 1');
-    expect(output).toContain('nutsnews_worker_deployment_info{adapter="in_memory",deployment="shadow",environment="local",service="nutsnews-worker-feed-fetcher"} 1');
+    expect(output).toContain('nutsnews_worker_build_info{environment="local",service="nutsnews-worker-feed-fetcher",version="0.1.0",revision="501ededcad48924b632b0547679f4dcb54ed4a90"} 1');
+    expect(output).toContain('nutsnews_worker_deployment_info{environment="local",service="nutsnews-worker-feed-fetcher",deployment="shadow",adapter="in_memory"} 1');
     expect(output).toContain('nutsnews_worker_expected_active{environment="local",service="nutsnews-worker-feed-fetcher"} 0');
     expect(output).toMatch(/nutsnews_worker_state_store_ready\{[^\n]+outcome="local-memory"[^\n]+\} 1/u);
     expect(output).toMatch(new RegExp(`nutsnews_worker_last_success_timestamp_seconds\\{[^\\n]+\\} ${String(Date.parse("2026-07-23T00:06:00.000Z") / 1_000)}`, "u"));
-    expect(output).toContain('nutsnews_worker_health_probe{environment="local",service="fetch",probe="liveness",outcome="ok"} 1');
-    expect(output).toContain('nutsnews_worker_health_probe{environment="local",service="fetch",probe="startup",outcome="unhealthy"} 1');
-    expect(output).toContain('nutsnews_worker_health_probe{environment="local",service="fetch",probe="readiness",outcome="unhealthy"} 1');
+    expectMetric(output, "nutsnews_worker_health_probe", {
+      probe: "liveness",
+      outcome: "ok"
+    }, 1);
+    expectMetric(output, "nutsnews_worker_health_probe", {
+      probe: "startup",
+      outcome: "unhealthy"
+    }, 1);
+    expectMetric(output, "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "unhealthy"
+    }, 1);
     expect(output).toContain('nutsnews_worker_metrics_enabled{environment="local",service="nutsnews-worker-feed-fetcher"} 1');
     expect(output).toContain('nutsnews_worker_telemetry_collection_ready{environment="local",service="nutsnews-worker-feed-fetcher"} 1');
 
@@ -137,7 +168,7 @@ describe("fetcher Prometheus metrics", () => {
     expect(output).not.toMatch(/feed_id|message_id|idempotency|correlation|trace|url=/u);
   });
 
-  it("replaces Runtime 0.5 summaries with fixed-bucket seconds histograms", async () => {
+  it("uses Runtime 1 fixed-bucket seconds histograms", async () => {
     const clock = new ManualFetcherClock();
     const config = loadFetcherConfig({
       HOSTNAME: "fetcher-host"
@@ -168,7 +199,7 @@ describe("fetcher Prometheus metrics", () => {
 
     const output = metrics.collect();
 
-    expect(FETCHER_DURATION_HISTOGRAM_BUCKETS_SECONDS).toContain(0.025);
+    expect(RUNTIME_DURATION_HISTOGRAM_BUCKETS_SECONDS).toContain(0.025);
     expect(output).toContain('# TYPE nutsnews_worker_dependency_duration_seconds histogram');
     expect(output).toMatch(/nutsnews_worker_dependency_duration_seconds_bucket\{[^\n]+outcome="success",dependency="feed-fetch",le="0.025"\} 0/u);
     expect(output).toMatch(/nutsnews_worker_dependency_duration_seconds_bucket\{[^\n]+outcome="success",dependency="feed-fetch",le="0.05"\} 1/u);
@@ -252,7 +283,7 @@ describe("fetcher Prometheus metrics", () => {
     expect(FETCHER_METRIC_DEPENDENCIES).toEqual([
       "feed-fetch",
       "broker-settlement",
-      "other"
+      "state-store"
     ]);
     expect(dependencyCounts).toHaveLength(1);
     expect(dependencyCounts[0]).toContain('dependency="other"');
@@ -262,7 +293,7 @@ describe("fetcher Prometheus metrics", () => {
     expect(output).not.toContain("private.example.test");
   });
 
-  it("keeps one seeded health family while consuming health events locally", async () => {
+  it("forwards one bounded Runtime 1 health family with check latency", async () => {
     const clock = new ManualFetcherClock();
     const config = loadFetcherConfig({
       HOSTNAME: "fetcher-host"
@@ -285,15 +316,36 @@ describe("fetcher Prometheus metrics", () => {
       stage: "fetch",
       outcome: "ok",
       attributes: {
-        probe: "readiness"
+        probe: "readiness",
+        checks: [{
+          name: "durable-state",
+          status: "ok",
+          critical: true,
+          durationMs: 25
+        }]
       }
     });
 
     const output = metrics.collect();
 
-    expect(output.split("\n").filter((line) => line === "# HELP nutsnews_worker_health_probe Worker liveness, startup, and readiness state by bounded probe and outcome.")).toHaveLength(1);
-    expect(output.split("\n").filter((line) => line.startsWith("nutsnews_worker_health_probe{"))).toHaveLength(9);
-    expect(output).toContain('nutsnews_worker_health_probe{environment="local",service="fetch",probe="readiness",outcome="ok"} 1');
+    expect(output.split("\n").filter((line) => line === "# HELP nutsnews_worker_health_probe Worker liveness, startup, and readiness state by probe and outcome.")).toHaveLength(1);
+    expect(output.split("\n").filter((line) => line.startsWith("# HELP nutsnews_worker_health_check "))).toHaveLength(1);
+    expect(output.split("\n").filter((line) => line.startsWith("# HELP nutsnews_worker_health_check_duration_seconds "))).toHaveLength(1);
+    expect(output.split("\n").filter((line) => line.startsWith("nutsnews_worker_health_probe{"))).toHaveLength(3);
+    expectMetric(output, "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "ok"
+    }, 1);
+    expectMetric(output, "nutsnews_worker_health_check", {
+      probe: "readiness",
+      outcome: "ok",
+      check: "durable-state"
+    }, 1);
+    expectMetric(output, "nutsnews_worker_health_check_duration_seconds_sum", {
+      probe: "readiness",
+      check: "durable-state"
+    }, 0.025);
+    expect(output).not.toContain('probe="unspecified"');
     expect(output).not.toContain("nutsnews_worker_health{");
   });
 
@@ -361,6 +413,8 @@ describe("fetcher Prometheus metrics", () => {
       "dlq",
       "failure"
     ]);
+    expect(FETCHER_STAGE_LATENCY_BUCKETS_SECONDS).toContain(0.005);
+    expect(FETCHER_STAGE_LATENCY_BUCKETS_SECONDS).toContain(0.025);
     expect(FETCHER_STAGE_LATENCY_BUCKETS_SECONDS).toContain(30);
     expect(output).toContain('nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="success"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="duplicate"} 1');
@@ -368,7 +422,9 @@ describe("fetcher Prometheus metrics", () => {
     expect(output).toContain('nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="retry"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="dlq"} 2');
     expect(output).toContain('nutsnews_worker_uplift_stage_events_total{environment="local",service="fetch",outcome="failure"} 1');
+    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="0.005"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="0.01"} 1');
+    expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="0.025"} 1');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="0.05"} 2');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="0.25"} 3');
     expect(output).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="10"} 4');
@@ -399,4 +455,19 @@ function canonicalStageSeriesKeys(output: string): readonly string[] {
       || line.startsWith("nutsnews_worker_uplift_stage_latency_seconds_"))
     .map((line) => line.slice(0, line.lastIndexOf(" ")))
     .sort();
+}
+
+function expectMetric(
+  output: string,
+  name: string,
+  labels: Readonly<Record<string, string>>,
+  value: string | number
+): void {
+  const line = output.split("\n").find((candidate) =>
+    candidate.startsWith(`${name}{`)
+    && candidate.endsWith(` ${String(value)}`)
+    && Object.entries(labels).every(([label, labelValue]) => candidate.includes(`${label}="${labelValue}"`))
+  );
+
+  expect(line, `${name} with ${JSON.stringify(labels)}=${String(value)}`).toBeDefined();
 }

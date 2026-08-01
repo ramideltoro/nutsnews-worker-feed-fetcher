@@ -112,12 +112,14 @@ describe("fetcher application lifecycle", () => {
       claim: delegate.claim.bind(delegate),
       markCompleted: delegate.markCompleted.bind(delegate),
       markFailed: delegate.markFailed.bind(delegate),
+      releaseClaim: delegate.releaseClaim.bind(delegate),
       getFeedMetadata: delegate.getFeedMetadata.bind(delegate),
       recordFetchOutcome: delegate.recordFetchOutcome.bind(delegate),
       claimCandidate: delegate.claimCandidate.bind(delegate),
       markCandidatePublished: delegate.markCandidatePublished.bind(delegate),
       markCandidatePublishFailed: delegate.markCandidatePublishFailed.bind(delegate),
-      listPendingCandidatePublications: delegate.listPendingCandidatePublications.bind(delegate)
+      listPendingCandidatePublications: delegate.listPendingCandidatePublications.bind(delegate),
+      claimPendingCandidatePublications: delegate.claimPendingCandidatePublications.bind(delegate)
     };
     const broker = new LocalBrokerTransport();
     const application = createFetcherApplication(config, {
@@ -165,12 +167,14 @@ function createGatedStateStore(gate: Promise<void>): FetcherDurableStateStore {
     claim: delegate.claim.bind(delegate),
     markCompleted: delegate.markCompleted.bind(delegate),
     markFailed: delegate.markFailed.bind(delegate),
+    releaseClaim: delegate.releaseClaim.bind(delegate),
     getFeedMetadata: delegate.getFeedMetadata.bind(delegate),
     recordFetchOutcome: delegate.recordFetchOutcome.bind(delegate),
     claimCandidate: delegate.claimCandidate.bind(delegate),
     markCandidatePublished: delegate.markCandidatePublished.bind(delegate),
     markCandidatePublishFailed: delegate.markCandidatePublishFailed.bind(delegate),
-    listPendingCandidatePublications: delegate.listPendingCandidatePublications.bind(delegate)
+    listPendingCandidatePublications: delegate.listPendingCandidatePublications.bind(delegate),
+    claimPendingCandidatePublications: delegate.claimPendingCandidatePublications.bind(delegate)
   };
 }
 

@@ -8,6 +8,36 @@ import type {
   RuntimeMessageContext
 } from "@ramideltoro/nutsnews-worker-runtime";
 
+export const FETCHER_MAX_CLAIM_LEASE_MS = 300_000 as const;
+
+/**
+ * Marks a broker outcome that proves the candidate was not accepted for
+ * delivery. Unknown failures intentionally remain ambiguous and retain their
+ * fenced outbox lease until expiry.
+ */
+export class FetcherDefinitePublishError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : {
+      cause
+    });
+    this.name = "FetcherDefinitePublishError";
+  }
+}
+
+export function isFetcherDefinitePublishError(error: unknown): boolean {
+  let current = error;
+
+  for (let depth = 0; depth < 8 && current instanceof Error; depth += 1) {
+    if (current instanceof FetcherDefinitePublishError) {
+      return true;
+    }
+
+    current = current.cause;
+  }
+
+  return false;
+}
+
 export interface FetcherDependencyProbe {
   readonly status: "ok" | "degraded" | "unhealthy";
   readonly summary: string;
@@ -83,6 +113,7 @@ export interface FetcherDnsPolicy {
 export interface FetcherBrokerTransport extends RuntimeBrokerTransport {
   readonly name: string;
   readonly adapterMode: FetcherDependencyAdapterMode;
+  onConsumerStateChange?(listener: () => void): () => void;
 }
 
 export type FetcherStateStoreMode = "local-memory" | "postgresql" | "unsupported";
@@ -99,6 +130,7 @@ export interface FetcherDurableStateStore extends RuntimeIdempotencyStore {
   markCandidatePublished(candidateId: string, publication: FetcherCandidatePublication): Promise<void>;
   markCandidatePublishFailed(candidateId: string, failure: FetcherCandidatePublicationFailure): Promise<void>;
   listPendingCandidatePublications(query: FetcherPendingPublicationQuery): Promise<readonly FetcherPendingCandidatePublication[]>;
+  claimPendingCandidatePublications(query: FetcherPendingPublicationQuery): Promise<readonly FetcherClaimedPendingCandidatePublication[]>;
   close?(): Promise<void>;
 }
 
@@ -177,7 +209,6 @@ export interface FetcherCandidateClaim {
   readonly sourceItemId: string;
   readonly contentFingerprint: string;
   readonly firstSeenAt: string;
-  readonly claimOwnerKey: string;
   readonly command: BrokerPublishCommand;
 }
 
@@ -185,6 +216,7 @@ export type FetcherCandidateClaimResult =
   | {
       readonly status: "claimed";
       readonly command: BrokerPublishCommand;
+      readonly claimToken: string;
     }
   | {
       readonly status: "already-published";
@@ -200,13 +232,13 @@ export interface FetcherCandidatePublication {
   readonly publishedAt: string;
   readonly messageId: string;
   readonly idempotencyKey: string;
-  readonly claimOwnerKey: string;
+  readonly claimToken: string;
 }
 
 export interface FetcherCandidatePublicationFailure {
   readonly failedAt: string;
   readonly idempotencyKey: string;
-  readonly claimOwnerKey: string;
+  readonly claimToken: string;
   readonly reason: string;
 }
 
@@ -217,9 +249,12 @@ export interface FetcherPendingPublicationQuery {
 
 export interface FetcherPendingCandidatePublication {
   readonly candidateId: string;
-  readonly claimOwnerKey: string;
   readonly command: BrokerPublishCommand;
   readonly createdAt: string;
+}
+
+export interface FetcherClaimedPendingCandidatePublication extends FetcherPendingCandidatePublication {
+  readonly claimToken: string;
 }
 
 export interface FetcherWorkTools {

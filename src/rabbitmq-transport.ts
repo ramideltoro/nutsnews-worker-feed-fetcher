@@ -34,7 +34,10 @@ import {
   type Options
 } from "amqplib";
 
-import type { FetcherBrokerTransport } from "./dependencies.js";
+import {
+  FetcherDefinitePublishError,
+  type FetcherBrokerTransport
+} from "./dependencies.js";
 import { bestEffortTelemetrySink } from "./telemetry-safety.js";
 
 const DEFAULT_CONFIRM_TIMEOUT_MS = WORKER_DELIVERY_BEHAVIOR.confirmTimeoutMs;
@@ -63,6 +66,7 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
   private readonly telemetry: RuntimeTelemetrySink | undefined;
   private readonly connectToBroker: RabbitMqConnect;
   private readonly consumers = new Map<WorkerStage, PayloadConsumerRegistration>();
+  private readonly consumerStateListeners = new Set<() => void>();
   private readonly inFlight = new Set<Promise<void>>();
   private connection: ChannelModel | undefined;
   private channel: ConfirmChannel | undefined;
@@ -94,6 +98,14 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
     return this.consumers.get(stage)?.monitor.status;
   }
 
+  onConsumerStateChange(listener: () => void): () => void {
+    this.consumerStateListeners.add(listener);
+
+    return () => {
+      this.consumerStateListeners.delete(listener);
+    };
+  }
+
   async connect(): Promise<void> {
     this.closing = false;
     await this.ensureChannel();
@@ -112,7 +124,15 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
 
   async publish(command: BrokerPublishCommand): Promise<BrokerPublishReceipt> {
     const route = getWorkerRoute(command.envelope.route);
-    const channel = await this.ensureChannel();
+    let channel: ConfirmChannel;
+
+    try {
+      channel = await this.ensureChannel();
+    } catch (error: unknown) {
+      // The carrier has not been handed to amqplib yet, so this is one of the
+      // few failures for which an immediate retry is provably safe.
+      throw new FetcherDefinitePublishError("RabbitMQ channel was unavailable before publish.", error);
+    }
 
     await publishCarrierWithConfirm(channel, {
       carrier: {
@@ -140,6 +160,7 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
 
     if (existing?.consumerTag !== undefined) {
       existing.monitor.markClosed("consumer-replaced");
+      this.notifyConsumerStateChange();
       await channel.cancel(existing.consumerTag).catch(() => undefined);
     }
 
@@ -163,6 +184,7 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
         const registered = this.consumers.get(stage);
         this.consumers.delete(stage);
         registered?.monitor.markClosed("consumer-handle-cancelled");
+        this.notifyConsumerStateChange();
 
         if (registered?.consumerTag !== undefined && this.channel !== undefined) {
           await this.channel.cancel(registered.consumerTag).catch(() => undefined);
@@ -212,6 +234,7 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
           void channel.cancel(registration.consumerTag).catch(() => undefined);
         }
         registration.monitor.markClosed("transport-closing");
+        this.notifyConsumerStateChange();
       }
     }
 
@@ -352,11 +375,13 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
 
     const route = getWorkerRoute(stage);
     registration.monitor.markRecovering("consumer-activation");
+    this.notifyConsumerStateChange();
     await channel.prefetch(this.prefetchCount);
     const reply = await channel.consume(route.mainQueue.name, (message) => {
       if (message === null) {
         registration.consumerTag = undefined;
         registration.monitor.markCancelled("broker-cancelled-consumer");
+        this.notifyConsumerStateChange();
         this.recoverCancelledConsumer(stage, registration, channel);
         return;
       }
@@ -377,6 +402,7 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
 
     registration.consumerTag = reply.consumerTag;
     registration.monitor.markActive("consumer-registered");
+    this.notifyConsumerStateChange();
   }
 
   private markChannelClosed(channel: ConfirmChannel, reason: string): void {
@@ -391,10 +417,22 @@ export class PayloadRabbitMqTransport implements FetcherBrokerTransport {
     for (const registration of this.consumers.values()) {
       registration.consumerTag = undefined;
       registration.monitor.markChannelDropped(reason);
+      this.notifyConsumerStateChange();
     }
 
     if (!this.closing && connection !== undefined) {
       void connection.close().catch(() => undefined);
+    }
+  }
+
+  private notifyConsumerStateChange(): void {
+    for (const listener of this.consumerStateListeners) {
+      try {
+        listener();
+      } catch {
+        // A health refresh listener is observability-only and must not alter
+        // broker recovery, cancellation, or delivery semantics.
+      }
     }
   }
 
@@ -729,7 +767,9 @@ async function publishCarrierWithConfirm(
     };
     const onReturn = (returned: unknown): void => {
       if (returnedMessageId(returned) === options.carrier.envelope.messageId) {
-        fail(new Error(`RabbitMQ publish was returned for ${options.exchange}:${options.routingKey}.`));
+        fail(new FetcherDefinitePublishError(
+          `RabbitMQ publish was returned for ${options.exchange}:${options.routingKey}.`
+        ));
       }
     };
     const onClose = (): void => {
@@ -746,23 +786,31 @@ async function publishCarrierWithConfirm(
     channel.on("return", onReturn);
     channel.on("close", onClose);
     channel.on("error", onChannelError);
-    channel.publish(
-      options.exchange,
-      options.routingKey,
-      content,
-      publishOptions(options.carrier.envelope, options.retryJitterMs),
-      (error: unknown) => {
-        if (error !== null && error !== undefined) {
-          fail(error instanceof Error ? error : new Error("RabbitMQ publish confirm failed."));
-          return;
-        }
+    try {
+      channel.publish(
+        options.exchange,
+        options.routingKey,
+        content,
+        publishOptions(options.carrier.envelope, options.retryJitterMs),
+        (error: unknown) => {
+          if (error !== null && error !== undefined) {
+            // amqplib can surface a channel-close error through this same
+            // callback while a publish is unconfirmed. Treat it as ambiguous.
+            fail(error instanceof Error ? error : new Error("RabbitMQ publish confirm failed."));
+            return;
+          }
 
-        if (!settled) {
-          cleanup();
-          resolve();
+          if (!settled) {
+            cleanup();
+            resolve();
+          }
         }
-      }
-    );
+      );
+    } catch (error: unknown) {
+      // Once channel.publish has been entered, a synchronous failure can still
+      // follow partial frame writes. Conservatively retain the outbox lease.
+      fail(error instanceof Error ? error : new Error("RabbitMQ publish failed ambiguously."));
+    }
   });
 }
 

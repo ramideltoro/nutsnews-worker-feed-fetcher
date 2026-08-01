@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   assertWorkerEnvelope,
@@ -8,6 +8,7 @@ import {
 import type {
   RuntimeClock,
   RuntimeIdempotencyClaimContext,
+  RuntimeIdempotencyClaimReleaseResult,
   RuntimeIdempotencyClaimResult,
   RuntimeIdempotencyCompletion,
   RuntimeIdempotencyFailure
@@ -23,6 +24,7 @@ import type {
   FetcherCandidateClaimResult,
   FetcherCandidatePublication,
   FetcherCandidatePublicationFailure,
+  FetcherClaimedPendingCandidatePublication,
   FetcherDependencyProbe,
   FetcherDurableStateStore,
   FetcherFeedMetadata,
@@ -30,9 +32,10 @@ import type {
   FetcherPendingCandidatePublication,
   FetcherPendingPublicationQuery
 } from "./dependencies.js";
+import { FETCHER_MAX_CLAIM_LEASE_MS } from "./dependencies.js";
 
 export const FETCHER_POSTGRES_SCHEMA = "worker_uplift_fetcher" as const;
-export const FETCHER_POSTGRES_STATE_CONTRACT_VERSION = 1 as const;
+export const FETCHER_POSTGRES_STATE_CONTRACT_VERSION = 2 as const;
 export const FETCHER_FETCH_OUTCOME_RETENTION_DAYS = 30 as const;
 
 function uniqueConstraintExpression(
@@ -59,6 +62,34 @@ function uniqueConstraintExpression(
   )`;
 }
 
+function claimTokenIndexExpression(
+  table: "inbox" | "outbox",
+  indexName: string
+): string {
+  return `EXISTS (
+    SELECT 1
+    FROM pg_class index_relation
+    JOIN pg_namespace index_namespace
+      ON index_namespace.oid = index_relation.relnamespace
+    JOIN pg_index index_row
+      ON index_row.indexrelid = index_relation.oid
+    JOIN pg_attribute attribute_row
+      ON attribute_row.attrelid = index_row.indrelid
+     AND attribute_row.attnum = index_row.indkey[0]
+    WHERE index_namespace.nspname = '${FETCHER_POSTGRES_SCHEMA}'
+      AND index_relation.relname = '${indexName}'
+      AND index_row.indrelid = '${FETCHER_POSTGRES_SCHEMA}.${table}'::regclass
+      AND index_row.indisunique
+      AND index_row.indisvalid
+      AND index_row.indisready
+      AND index_row.indnkeyatts = 1
+      AND index_row.indnatts = 1
+      AND attribute_row.attname = 'claim_token'
+      AND pg_get_expr(index_row.indpred, index_row.indrelid)
+        IN ('claim_token IS NOT NULL', '(claim_token IS NOT NULL)')
+  )`;
+}
+
 export interface PostgresFetcherPoolOptions {
   readonly databaseUrl: string;
   readonly applicationName: string;
@@ -71,6 +102,7 @@ export interface PostgresFetcherStateStoreOptions {
   readonly clock: RuntimeClock;
   readonly leaseMs: number;
   readonly ownsPool?: boolean;
+  readonly claimTokenFactory?: () => string;
 }
 
 export class FetcherStateOwnershipError extends Error {
@@ -111,15 +143,21 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
   readonly adapter = "backend-postgresql";
   readonly durable = true;
   readonly #pool: Pool;
-  readonly #clock: RuntimeClock;
   readonly #leaseMs: number;
   readonly #ownsPool: boolean;
+  readonly #claimTokenFactory: () => string;
 
   constructor(options: PostgresFetcherStateStoreOptions) {
     this.#pool = options.pool;
-    this.#clock = options.clock;
+    if (!Number.isInteger(options.leaseMs)
+      || options.leaseMs <= 0
+      || options.leaseMs > FETCHER_MAX_CLAIM_LEASE_MS) {
+      throw new RangeError(`Fetcher claim lease must be an integer from 1 to ${String(FETCHER_MAX_CLAIM_LEASE_MS)} milliseconds.`);
+    }
+
     this.#leaseMs = options.leaseMs;
     this.#ownsPool = options.ownsPool ?? false;
+    this.#claimTokenFactory = options.claimTokenFactory ?? randomUUID;
   }
 
   async probe(): Promise<FetcherDependencyProbe> {
@@ -132,7 +170,8 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
                     operation_version, idempotency_key, payload_ref, payload_digest,
                     received_at, processed_at, status, diagnostic_metadata,
                     sanitized_error_code, sanitized_error_message,
-                    claim_owner_message_id, claim_expires_at, updated_at
+                    claim_owner_message_id, claim_token, claim_acquired_at,
+                    claim_expires_at, updated_at
              FROM ${FETCHER_POSTGRES_SCHEMA}.inbox
              WHERE false
            ),
@@ -142,7 +181,8 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
                     schema_version, operation_version, idempotency_key, payload_ref,
                     payload_digest, created_at, published_at, confirmed_at, status,
                     diagnostic_metadata, sanitized_error_code, sanitized_error_message,
-                    claim_owner_key, claim_expires_at, publication_command, updated_at
+                    claim_owner_key, claim_token, claim_acquired_at,
+                    claim_expires_at, publication_command, updated_at
              FROM ${FETCHER_POSTGRES_SCHEMA}.outbox
              WHERE false
            ),
@@ -192,14 +232,18 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
                   AND has_sequence_privilege(current_user, '${FETCHER_POSTGRES_SCHEMA}.fetch_outcomes_id_seq', 'USAGE')
                   AND has_sequence_privilege(current_user, '${FETCHER_POSTGRES_SCHEMA}.feed_health_projections_id_seq', 'USAGE') AS sequence_privileges_ready,
                 (
-                  SELECT count(*) = 11
+                  SELECT count(*) = 15
                   FROM information_schema.columns
                   WHERE table_schema = '${FETCHER_POSTGRES_SCHEMA}'
                     AND (
                       (table_name = 'inbox' AND column_name = 'claim_owner_message_id' AND udt_name = 'text' AND is_nullable = 'YES')
+                      OR (table_name = 'inbox' AND column_name = 'claim_token' AND udt_name = 'text' AND is_nullable = 'YES')
+                      OR (table_name = 'inbox' AND column_name = 'claim_acquired_at' AND udt_name = 'timestamptz' AND is_nullable = 'YES')
                       OR (table_name = 'inbox' AND column_name = 'claim_expires_at' AND udt_name = 'timestamptz' AND is_nullable = 'YES')
                       OR (table_name = 'inbox' AND column_name = 'diagnostic_metadata' AND udt_name = 'jsonb' AND is_nullable = 'NO')
                       OR (table_name = 'outbox' AND column_name = 'claim_owner_key' AND udt_name = 'text' AND is_nullable = 'YES')
+                      OR (table_name = 'outbox' AND column_name = 'claim_token' AND udt_name = 'text' AND is_nullable = 'YES')
+                      OR (table_name = 'outbox' AND column_name = 'claim_acquired_at' AND udt_name = 'timestamptz' AND is_nullable = 'YES')
                       OR (table_name = 'outbox' AND column_name = 'claim_expires_at' AND udt_name = 'timestamptz' AND is_nullable = 'YES')
                       OR (table_name = 'outbox' AND column_name = 'publication_command' AND udt_name = 'jsonb' AND is_nullable = 'YES')
                       OR (table_name = 'fetch_versions' AND column_name = 'content_fingerprint' AND udt_name = 'text' AND is_nullable = 'YES')
@@ -219,7 +263,55 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
                       AND constraint_row.contype = 'c'
                       AND pg_get_constraintdef(constraint_row.oid) LIKE '%publication_command%'
                       AND pg_get_constraintdef(constraint_row.oid) LIKE '%jsonb_typeof%'
-                  ) AS constraint_contract_ready
+                  ) AS constraint_contract_ready,
+                ${claimTokenIndexExpression("inbox", "worker_uplift_fetcher_inbox_claim_token_idx")}
+                  AND ${claimTokenIndexExpression("outbox", "worker_uplift_fetcher_outbox_claim_token_idx")}
+                  AND EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conrelid = '${FETCHER_POSTGRES_SCHEMA}.inbox'::regclass
+                      AND conname = 'worker_uplift_fetcher_inbox_claim_lease_check'
+                      AND contype = 'c'
+                      AND convalidated
+                      AND pg_get_constraintdef(oid) LIKE '%claim_token IS NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%claim_acquired_at IS NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%claim_expires_at IS NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%claim_token IS NOT NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%char_length(claim_token) >= 8%'
+                      AND pg_get_constraintdef(oid) LIKE '%char_length(claim_token) <= 160%'
+                      AND pg_get_constraintdef(oid) LIKE '%COLLATE "C"%'
+                      AND strpos(pg_get_constraintdef(oid), '^[A-Za-z0-9][A-Za-z0-9._:-]{7,159}$') > 0
+                      AND pg_get_constraintdef(oid) LIKE '%claim_acquired_at IS NOT NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%claim_expires_at IS NOT NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%claim_expires_at > claim_acquired_at%'
+                      AND (
+                        pg_get_constraintdef(oid) LIKE '%claim_expires_at <=%claim_acquired_at +%00:05:00%'
+                        OR pg_get_constraintdef(oid) LIKE '%claim_expires_at <=%claim_acquired_at +%5 minutes%'
+                      )
+                  )
+                  AND EXISTS (
+                    SELECT 1
+                    FROM pg_constraint
+                    WHERE conrelid = '${FETCHER_POSTGRES_SCHEMA}.outbox'::regclass
+                      AND conname = 'worker_uplift_fetcher_outbox_claim_lease_check'
+                      AND contype = 'c'
+                      AND convalidated
+                      AND pg_get_constraintdef(oid) LIKE '%claim_token IS NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%claim_acquired_at IS NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%claim_expires_at IS NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%claim_token IS NOT NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%char_length(claim_token) >= 8%'
+                      AND pg_get_constraintdef(oid) LIKE '%char_length(claim_token) <= 160%'
+                      AND pg_get_constraintdef(oid) LIKE '%COLLATE "C"%'
+                      AND strpos(pg_get_constraintdef(oid), '^[A-Za-z0-9][A-Za-z0-9._:-]{7,159}$') > 0
+                      AND pg_get_constraintdef(oid) LIKE '%claim_acquired_at IS NOT NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%claim_expires_at IS NOT NULL%'
+                      AND pg_get_constraintdef(oid) LIKE '%claim_expires_at > claim_acquired_at%'
+                      AND (
+                        pg_get_constraintdef(oid) LIKE '%claim_expires_at <=%claim_acquired_at +%00:05:00%'
+                        OR pg_get_constraintdef(oid) LIKE '%claim_expires_at <=%claim_acquired_at +%5 minutes%'
+                      )
+                  ) AS claim_fencing_ready
          FROM ${FETCHER_POSTGRES_SCHEMA}.state_contract AS state_contract
          WHERE state_contract.component = 'fetcher_state_store'
          LIMIT 1`
@@ -240,7 +332,8 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
         && row.feed_health_privileges_ready
         && row.sequence_privileges_ready
         && row.column_contract_ready
-        && row.constraint_contract_ready;
+        && row.constraint_contract_ready
+        && row.claim_fencing_ready;
 
       return {
         status: ready ? "ok" : "unhealthy",
@@ -261,18 +354,19 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
     context: RuntimeIdempotencyClaimContext
   ): Promise<RuntimeIdempotencyClaimResult> {
     return withTransaction(this.#pool, async (client) => {
-      const claimExpiresAt = this.leaseExpiresAt();
+      const claimToken = this.nextClaimToken();
       const inserted = await client.query<{ readonly received_at: Date }>(
         `INSERT INTO ${FETCHER_POSTGRES_SCHEMA}.inbox (
            message_id, pipeline_run_id, stage_execution_id, source_stage, source_message_id,
            entity_kind, entity_id, schema_version, operation_version, idempotency_key,
            payload_ref, payload_digest, received_at, status, diagnostic_metadata,
-           claim_owner_message_id, claim_expires_at, updated_at
+           claim_owner_message_id, claim_token, claim_acquired_at, claim_expires_at, updated_at
          ) VALUES (
            $1, $2, $3, $4, $5,
            $6, $7, $8, $9, $10,
            $11, $12, $13::timestamptz, 'processing', $14::jsonb,
-           $1, $15::timestamptz, now()
+           $1, $15, statement_timestamp(),
+           statement_timestamp() + ($16::integer * interval '1 millisecond'), statement_timestamp()
          )
          ON CONFLICT (idempotency_key) DO NOTHING
          RETURNING received_at`,
@@ -294,7 +388,8 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
             route: context.envelope.route,
             attempt: context.envelope.attempt
           }),
-          claimExpiresAt
+          claimToken,
+          this.#leaseMs
         ]
       );
 
@@ -302,12 +397,15 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
         return {
           status: "claimed",
           firstSeenAt: context.receivedAt,
-          replay: false
+          replay: false,
+          claimToken
         };
       }
 
       const existing = await client.query<InboxClaimRow>(
-        `SELECT status, received_at, processed_at, claim_owner_message_id, claim_expires_at
+        `SELECT status, received_at, processed_at, claim_owner_message_id, claim_token,
+                claim_expires_at,
+                (claim_expires_at IS NULL OR claim_expires_at <= statement_timestamp()) AS claim_expired
          FROM ${FETCHER_POSTGRES_SCHEMA}.inbox
          WHERE idempotency_key = $1
          FOR UPDATE`,
@@ -335,7 +433,7 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
       const reclaimable = row.status === "failed"
         || row.status === "parked"
         || row.status === "received"
-        || expired(row.claim_expires_at, this.#clock.now());
+        || row.claim_expired;
 
       if (!reclaimable) {
         return {
@@ -351,14 +449,17 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
              sanitized_error_code = NULL,
              sanitized_error_message = NULL,
              claim_owner_message_id = $2,
-             claim_expires_at = $3::timestamptz,
-             updated_at = now(),
-             diagnostic_metadata = diagnostic_metadata || $4::jsonb
+             claim_token = $3,
+             claim_acquired_at = statement_timestamp(),
+             claim_expires_at = statement_timestamp() + ($4::integer * interval '1 millisecond'),
+             updated_at = statement_timestamp(),
+             diagnostic_metadata = diagnostic_metadata || $5::jsonb
          WHERE idempotency_key = $1`,
         [
           idempotencyKey,
           context.envelope.messageId,
-          claimExpiresAt,
+          claimToken,
+          this.#leaseMs,
           JSON.stringify({
             replayedAt: context.receivedAt,
             replayMessageId: context.envelope.messageId,
@@ -370,7 +471,8 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
       return {
         status: "claimed",
         firstSeenAt,
-        replay: true
+        replay: true,
+        claimToken
       };
     });
   }
@@ -379,16 +481,21 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
     const result = await this.#pool.query(
       `UPDATE ${FETCHER_POSTGRES_SCHEMA}.inbox
        SET status = 'processed',
-           processed_at = $3::timestamptz,
+           processed_at = $4::timestamptz,
+           claim_token = NULL,
+           claim_acquired_at = NULL,
            claim_expires_at = NULL,
            updated_at = now(),
-           diagnostic_metadata = diagnostic_metadata || $4::jsonb
+           diagnostic_metadata = diagnostic_metadata || $5::jsonb
        WHERE idempotency_key = $1
-         AND claim_owner_message_id = $2
-         AND status IN ('processing', 'processed')
+         AND claim_token = $2
+         AND claim_owner_message_id = $3
+         AND status = 'processing'
+         AND claim_expires_at > statement_timestamp()
        RETURNING id`,
       [
         idempotencyKey,
+        completion.claimToken,
         completion.messageId,
         completion.completedAt,
         JSON.stringify({
@@ -405,17 +512,22 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
     const result = await this.#pool.query(
       `UPDATE ${FETCHER_POSTGRES_SCHEMA}.inbox
        SET status = 'failed',
-           sanitized_error_code = $3,
-           sanitized_error_message = $4,
+           sanitized_error_code = $4,
+           sanitized_error_message = $5,
+           claim_token = NULL,
+           claim_acquired_at = NULL,
            claim_expires_at = NULL,
            updated_at = now(),
-           diagnostic_metadata = diagnostic_metadata || $5::jsonb
+           diagnostic_metadata = diagnostic_metadata || $6::jsonb
        WHERE idempotency_key = $1
-         AND claim_owner_message_id = $2
-         AND status IN ('processing', 'failed')
+         AND claim_token = $2
+         AND claim_owner_message_id = $3
+         AND status = 'processing'
+         AND claim_expires_at > statement_timestamp()
        RETURNING id`,
       [
         idempotencyKey,
+        failure.claimToken,
         failure.messageId,
         sanitizeCode(failure.reason),
         sanitizeMessage(failure.reason),
@@ -429,6 +541,66 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
     );
 
     assertOwned(result.rowCount, "markFailed");
+  }
+
+  async releaseClaim(
+    idempotencyKey: string,
+    failure: RuntimeIdempotencyFailure
+  ): Promise<RuntimeIdempotencyClaimReleaseResult> {
+    return withTransaction(this.#pool, async (client) => {
+      const released = await client.query(
+        `UPDATE ${FETCHER_POSTGRES_SCHEMA}.inbox
+         SET status = 'failed',
+             sanitized_error_code = $4,
+             sanitized_error_message = $5,
+             claim_token = NULL,
+             claim_acquired_at = NULL,
+             claim_expires_at = NULL,
+             updated_at = now(),
+             diagnostic_metadata = diagnostic_metadata || $6::jsonb
+         WHERE idempotency_key = $1
+           AND claim_token = $2
+           AND claim_owner_message_id = $3
+           AND status = 'processing'
+           AND claim_expires_at > statement_timestamp()
+         RETURNING id`,
+        [
+          idempotencyKey,
+          failure.claimToken,
+          failure.messageId,
+          sanitizeCode(failure.reason),
+          sanitizeMessage(failure.reason),
+          JSON.stringify({
+            releasedAt: failure.failedAt,
+            releasedMessageId: failure.messageId,
+            releasedStage: failure.stage,
+            retryable: failure.retryable
+          })
+        ]
+      );
+
+      if ((released.rowCount ?? 0) > 0) {
+        return {
+          status: "released"
+        };
+      }
+
+      const current = await client.query<{ readonly status: string }>(
+        `SELECT status
+         FROM ${FETCHER_POSTGRES_SCHEMA}.inbox
+         WHERE idempotency_key = $1
+         FOR UPDATE`,
+        [idempotencyKey]
+      );
+
+      return current.rows[0]?.status === "processed" || current.rows[0]?.status === "duplicate"
+        ? {
+            status: "preserved-completed"
+          }
+        : {
+            status: "not-owned"
+          };
+    });
   }
 
   async getFeedMetadata(feedId: string): Promise<FetcherFeedMetadata | undefined> {
@@ -518,21 +690,22 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
     return withTransaction(this.#pool, async (client) => {
       const command = claim.command;
       const route = getWorkerRoute(command.envelope.route);
-      const claimExpiresAt = this.leaseExpiresAt();
+      const claimToken = this.nextClaimToken();
       const publicationCommand = JSON.stringify(command);
       const inserted = await client.query(
         `INSERT INTO ${FETCHER_POSTGRES_SCHEMA}.outbox (
            outbox_message_id, pipeline_run_id, stage_execution_id, destination_stage,
            routing_key, entity_kind, entity_id, schema_version, operation_version,
            idempotency_key, payload_ref, payload_digest, created_at, status,
-           diagnostic_metadata, claim_owner_key, claim_expires_at,
+           diagnostic_metadata, claim_owner_key, claim_token, claim_acquired_at, claim_expires_at,
            publication_command, updated_at
          ) VALUES (
            $1, $2, $3, $4,
            $5, $6, $7, $8, $9,
            $10, $11, $12, $13::timestamptz, 'pending',
-           $14::jsonb, $15, $16::timestamptz,
-           $17::jsonb, now()
+           $14::jsonb, $15, $16, statement_timestamp(),
+           statement_timestamp() + ($17::integer * interval '1 millisecond'),
+           $18::jsonb, statement_timestamp()
          )
          ON CONFLICT (idempotency_key) DO NOTHING
          RETURNING id`,
@@ -555,8 +728,9 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
             sourceItemId: claim.sourceItemId,
             contentFingerprint: claim.contentFingerprint
           }),
-          claim.claimOwnerKey,
-          claimExpiresAt,
+          command.envelope.messageId,
+          claimToken,
+          this.#leaseMs,
           publicationCommand
         ]
       );
@@ -564,13 +738,19 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
       if ((inserted.rowCount ?? 0) > 0) {
         return {
           status: "claimed",
-          command
+          command,
+          claimToken
         };
       }
 
       const existing = await client.query<OutboxClaimRow>(
         `SELECT entity_id, status, outbox_message_id, created_at, confirmed_at,
-                claim_owner_key, claim_expires_at, publication_command
+                claim_owner_key, claim_token, claim_expires_at, publication_command,
+                (claim_expires_at IS NULL OR claim_expires_at <= statement_timestamp()) AS claim_expired,
+                greatest(1000, least(60000, coalesce(
+                  extract(epoch FROM (claim_expires_at - statement_timestamp())) * 1000,
+                  1000
+                )))::integer AS retry_after_ms
          FROM ${FETCHER_POSTGRES_SCHEMA}.outbox
          WHERE idempotency_key = $1
          FOR UPDATE`,
@@ -591,14 +771,12 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
       }
 
       const storedCommand = publicationCommandFromJson(row.publication_command);
-      const now = this.#clock.now();
-      const owned = row.claim_owner_key === claim.claimOwnerKey;
-      const reclaimable = owned || expired(row.claim_expires_at, now);
+      const reclaimable = row.status === "retrying" || row.claim_expired;
 
       if (!reclaimable) {
         return {
           status: "in-progress",
-          retryAfterMs: retryAfterMs(row.claim_expires_at, now)
+          retryAfterMs: row.retry_after_ms
         };
       }
 
@@ -606,21 +784,25 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
         `UPDATE ${FETCHER_POSTGRES_SCHEMA}.outbox
          SET status = 'pending',
              claim_owner_key = $2,
-             claim_expires_at = $3::timestamptz,
+             claim_token = $3,
+             claim_acquired_at = statement_timestamp(),
+             claim_expires_at = statement_timestamp() + ($4::integer * interval '1 millisecond'),
              sanitized_error_code = NULL,
              sanitized_error_message = NULL,
              updated_at = now()
          WHERE idempotency_key = $1`,
         [
           command.envelope.idempotencyKey,
-          claim.claimOwnerKey,
-          claimExpiresAt
+          command.envelope.messageId,
+          claimToken,
+          this.#leaseMs
         ]
       );
 
       return {
         status: "claimed",
-        command: storedCommand
+        command: storedCommand,
+        claimToken
       };
     });
   }
@@ -634,19 +816,22 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
        SET status = 'confirmed',
            published_at = $4::timestamptz,
            confirmed_at = $4::timestamptz,
+           claim_token = NULL,
+           claim_acquired_at = NULL,
            claim_expires_at = NULL,
            updated_at = now(),
            diagnostic_metadata = diagnostic_metadata || $5::jsonb
        WHERE entity_id = $1
          AND idempotency_key = $2
-         AND claim_owner_key = $3
+         AND claim_token = $3
          AND outbox_message_id = $6
          AND status IN ('pending', 'published', 'retrying', 'confirmed')
+         AND claim_expires_at > statement_timestamp()
        RETURNING id`,
       [
         candidateId,
         publication.idempotencyKey,
-        publication.claimOwnerKey,
+        publication.claimToken,
         publication.publishedAt,
         JSON.stringify({
           confirmedMessageId: publication.messageId
@@ -665,6 +850,8 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
     const updated = await this.#pool.query(
       `UPDATE ${FETCHER_POSTGRES_SCHEMA}.outbox
        SET status = 'retrying',
+           claim_token = NULL,
+           claim_acquired_at = NULL,
            claim_expires_at = NULL,
            sanitized_error_code = $4,
            sanitized_error_message = $5,
@@ -672,13 +859,14 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
            diagnostic_metadata = diagnostic_metadata || $6::jsonb
        WHERE entity_id = $1
          AND idempotency_key = $2
-         AND claim_owner_key = $3
+         AND claim_token = $3
          AND status IN ('pending', 'published', 'retrying')
+         AND claim_expires_at > statement_timestamp()
        RETURNING id`,
       [
         candidateId,
         failure.idempotencyKey,
-        failure.claimOwnerKey,
+        failure.claimToken,
         sanitizeCode(failure.reason),
         sanitizeMessage(failure.reason),
         JSON.stringify({
@@ -694,12 +882,12 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
     query: FetcherPendingPublicationQuery
   ): Promise<readonly FetcherPendingCandidatePublication[]> {
     const result = await this.#pool.query<PendingOutboxRow>(
-      `SELECT entity_id, claim_owner_key, publication_command, created_at
+      `SELECT id, entity_id, publication_command, created_at
        FROM ${FETCHER_POSTGRES_SCHEMA}.outbox
        WHERE entity_kind = 'candidate'
          AND status IN ('pending', 'published', 'retrying')
          AND publication_command IS NOT NULL
-         AND (claim_expires_at IS NULL OR claim_expires_at <= now())
+         AND (claim_expires_at IS NULL OR claim_expires_at <= statement_timestamp())
          AND created_at <= now() - ($2::integer * interval '1 second')
        ORDER BY created_at, id
        LIMIT $1`,
@@ -710,16 +898,61 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
     );
 
     return result.rows.map((row) => {
-      if (row.claim_owner_key === null) {
-        throw new FetcherStateContractError("Pending candidate outbox row has no claim owner.");
-      }
-
       return {
         candidateId: row.entity_id,
-        claimOwnerKey: row.claim_owner_key,
         command: publicationCommandFromJson(row.publication_command),
         createdAt: isoString(row.created_at)
       };
+    });
+  }
+
+  async claimPendingCandidatePublications(
+    query: FetcherPendingPublicationQuery
+  ): Promise<readonly FetcherClaimedPendingCandidatePublication[]> {
+    return withTransaction(this.#pool, async (client) => {
+      const result = await client.query<PendingOutboxRow>(
+        `SELECT id, entity_id, publication_command, created_at
+         FROM ${FETCHER_POSTGRES_SCHEMA}.outbox
+         WHERE entity_kind = 'candidate'
+           AND status IN ('pending', 'published', 'retrying')
+           AND publication_command IS NOT NULL
+           AND (claim_expires_at IS NULL OR claim_expires_at <= statement_timestamp())
+           AND created_at <= now() - ($1::integer * interval '1 second')
+         ORDER BY created_at, id
+         LIMIT 1
+         FOR UPDATE SKIP LOCKED`,
+        [
+          Math.max(0, Math.min(86_400, query.minAgeSeconds))
+        ]
+      );
+      const claimed: FetcherClaimedPendingCandidatePublication[] = [];
+
+      for (const row of result.rows) {
+        const claimToken = this.nextClaimToken();
+
+        await client.query(
+          `UPDATE ${FETCHER_POSTGRES_SCHEMA}.outbox
+           SET status = 'pending',
+               claim_token = $2,
+               claim_acquired_at = statement_timestamp(),
+               claim_expires_at = statement_timestamp() + ($3::integer * interval '1 millisecond'),
+               updated_at = statement_timestamp()
+           WHERE id = $1`,
+          [
+            row.id,
+            claimToken,
+            this.#leaseMs
+          ]
+        );
+        claimed.push({
+          candidateId: row.entity_id,
+          claimToken,
+          command: publicationCommandFromJson(row.publication_command),
+          createdAt: isoString(row.created_at)
+        });
+      }
+
+      return claimed;
     });
   }
 
@@ -729,8 +962,14 @@ export class PostgresFetcherStateStore implements FetcherDurableStateStore {
     }
   }
 
-  private leaseExpiresAt(): string {
-    return new Date(this.#clock.now().getTime() + this.#leaseMs).toISOString();
+  private nextClaimToken(): string {
+    const claimToken = this.#claimTokenFactory();
+
+    if (!/^[A-Za-z0-9][A-Za-z0-9._:-]{7,159}$/u.test(claimToken)) {
+      throw new FetcherStateContractError("Claim token factory returned an invalid bounded token.");
+    }
+
+    return claimToken;
   }
 }
 
@@ -750,6 +989,7 @@ interface StateContractRow extends QueryResultRow {
   readonly sequence_privileges_ready: boolean;
   readonly column_contract_ready: boolean;
   readonly constraint_contract_ready: boolean;
+  readonly claim_fencing_ready: boolean;
 }
 
 interface InboxClaimRow extends QueryResultRow {
@@ -757,7 +997,9 @@ interface InboxClaimRow extends QueryResultRow {
   readonly received_at: Date | string;
   readonly processed_at: Date | string | null;
   readonly claim_owner_message_id: string | null;
+  readonly claim_token: string | null;
   readonly claim_expires_at: Date | string | null;
+  readonly claim_expired: boolean;
 }
 
 interface FeedMetadataRow extends QueryResultRow {
@@ -775,13 +1017,16 @@ interface OutboxClaimRow extends QueryResultRow {
   readonly created_at: Date | string;
   readonly confirmed_at: Date | string | null;
   readonly claim_owner_key: string | null;
+  readonly claim_token: string | null;
   readonly claim_expires_at: Date | string | null;
+  readonly claim_expired: boolean;
+  readonly retry_after_ms: number;
   readonly publication_command: unknown;
 }
 
 interface PendingOutboxRow extends QueryResultRow {
+  readonly id: string;
   readonly entity_id: string;
-  readonly claim_owner_key: string | null;
   readonly publication_command: unknown;
   readonly created_at: Date | string;
 }
@@ -928,26 +1173,6 @@ function assertOwned(rowCount: number | null, operation: string): void {
   if ((rowCount ?? 0) === 0) {
     throw new FetcherStateOwnershipError(operation);
   }
-}
-
-function expired(value: Date | string | null, now: Date): boolean {
-  if (value === null) {
-    return true;
-  }
-
-  const expiry = new Date(value).getTime();
-
-  return !Number.isFinite(expiry) || expiry <= now.getTime();
-}
-
-function retryAfterMs(value: Date | string | null, now: Date): number {
-  if (value === null) {
-    return 1_000;
-  }
-
-  const remaining = new Date(value).getTime() - now.getTime();
-
-  return Math.max(1_000, Math.min(60_000, Number.isFinite(remaining) ? remaining : 1_000));
 }
 
 function isoString(value: Date | string): string {

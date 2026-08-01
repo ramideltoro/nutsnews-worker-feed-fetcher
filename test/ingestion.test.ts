@@ -12,6 +12,7 @@ import {
 } from "vitest";
 
 import { loadFetcherConfig } from "../src/config.js";
+import { FetcherDefinitePublishError } from "../src/dependencies.js";
 import { createFeedFetchWorkHandler } from "../src/ingestion.js";
 import { SequenceFetcherIdFactory } from "../src/ids.js";
 import { createFetcherPrometheusMetricsSink } from "../src/metrics.js";
@@ -169,6 +170,68 @@ describe("feed fetch ingestion handler", () => {
     expect(state.outcomes.map((outcome) => outcome.fetchStatus)).toEqual([
       "success"
     ]);
+
+    await context.service.stop();
+  });
+
+  it("retains the candidate lease for an ambiguous publish outcome", async () => {
+    const state = new PublicationFailureTrackingStateStore();
+    const broker = new AmbiguousOnceOnNthPublishBroker(2);
+    const context = createIngestionContext(rssResponse(), state, undefined, broker);
+    const delivery = createMinimalFetchDelivery();
+
+    await context.service.start();
+    await expect(context.broker.deliverFetch(delivery)).resolves.toMatchObject({
+      action: "retry",
+      reason: "handler-error"
+    });
+    expect(context.broker.published).toHaveLength(1);
+    expect(state.publishFailureRecords).toBe(0);
+    await expect(state.listPendingCandidatePublications({
+      maxItems: 100,
+      minAgeSeconds: 0
+    })).resolves.toEqual([]);
+
+    await expect(context.broker.deliverFetch(delivery)).resolves.toMatchObject({
+      action: "retry"
+    });
+    expect(context.broker.published).toHaveLength(1);
+    expect(state.publishFailureRecords).toBe(0);
+
+    await context.service.stop();
+  });
+
+  it("does not reopen a candidate after confirmed publish finalization is ambiguous at the last attempt", async () => {
+    const state = new AmbiguousFinalizationStateStore();
+    const context = createIngestionContext(rssResponse(), state);
+    const delivery = createMinimalFetchDelivery({
+      envelope: {
+        attempt: {
+          count: 4,
+          max: 4,
+          firstAttemptAt: "2026-07-23T00:00:00.000Z",
+          lastAttemptAt: "2026-07-23T00:20:00.000Z"
+        }
+      }
+    });
+
+    await context.service.start();
+    await expect(context.broker.deliverFetch(delivery)).resolves.toMatchObject({
+      action: "dlq",
+      reason: "handler-error"
+    });
+    expect(context.broker.published).toHaveLength(2);
+    expect(state.publishFailureRecords).toBe(0);
+    await expect(state.listPendingCandidatePublications({
+      maxItems: 100,
+      minAgeSeconds: 0
+    })).resolves.toEqual([]);
+
+    await expect(context.broker.deliverFetch(delivery)).resolves.toMatchObject({
+      action: "dlq"
+    });
+    expect(context.broker.published).toHaveLength(2);
+    expect(state.publishFailureRecords).toBe(0);
 
     await context.service.stop();
   });
@@ -728,10 +791,59 @@ class FailOnceOnNthPublishBroker extends LocalBrokerTransport {
 
     if (!this.failed && this.publishCalls === this.failOnCall) {
       this.failed = true;
-      return Promise.reject(new Error("simulated partial fan-out failure"));
+      return Promise.reject(new FetcherDefinitePublishError("simulated partial fan-out failure"));
     }
 
     return super.publish(command);
+  }
+}
+
+class AmbiguousOnceOnNthPublishBroker extends LocalBrokerTransport {
+  private publishCalls = 0;
+  private failed = false;
+
+  constructor(private readonly failOnCall: number) {
+    super();
+  }
+
+  override publish(
+    command: Parameters<LocalBrokerTransport["publish"]>[0]
+  ): ReturnType<LocalBrokerTransport["publish"]> {
+    this.publishCalls += 1;
+
+    if (!this.failed && this.publishCalls === this.failOnCall) {
+      this.failed = true;
+      return Promise.reject(new Error("simulated ambiguous publish outcome"));
+    }
+
+    return super.publish(command);
+  }
+}
+
+class PublicationFailureTrackingStateStore extends InMemoryFetcherStateStore {
+  publishFailureRecords = 0;
+
+  override markCandidatePublishFailed(
+    ...args: Parameters<InMemoryFetcherStateStore["markCandidatePublishFailed"]>
+  ): ReturnType<InMemoryFetcherStateStore["markCandidatePublishFailed"]> {
+    this.publishFailureRecords += 1;
+    return super.markCandidatePublishFailed(...args);
+  }
+}
+
+class AmbiguousFinalizationStateStore extends PublicationFailureTrackingStateStore {
+  private finalizationCalls = 0;
+
+  override markCandidatePublished(
+    ...args: Parameters<InMemoryFetcherStateStore["markCandidatePublished"]>
+  ): ReturnType<InMemoryFetcherStateStore["markCandidatePublished"]> {
+    this.finalizationCalls += 1;
+
+    if (this.finalizationCalls === 2) {
+      return Promise.reject(new Error("simulated lost finalization response"));
+    }
+
+    return super.markCandidatePublished(...args);
   }
 }
 

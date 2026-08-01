@@ -31,25 +31,51 @@ import {
 describe("createFetcherService", () => {
   it("exports explicit probe states before startup and transitions them with lifecycle", async () => {
     const context = createServiceContext();
+    await Promise.all([
+      context.service.health.liveness(),
+      context.service.health.startup(),
+      context.service.health.readiness()
+    ]);
     const initial = context.metrics.collect();
 
-    expect(initial).toContain('nutsnews_worker_health_probe{environment="local",service="fetch",probe="liveness",outcome="ok"} 1');
-    expect(initial).toContain('nutsnews_worker_health_probe{environment="local",service="fetch",probe="startup",outcome="unhealthy"} 1');
-    expect(initial).toContain('nutsnews_worker_health_probe{environment="local",service="fetch",probe="readiness",outcome="unhealthy"} 1');
+    expectMetric(initial, "nutsnews_worker_health_probe", {
+      probe: "liveness",
+      outcome: "ok"
+    }, 1);
+    expectMetric(initial, "nutsnews_worker_health_probe", {
+      probe: "startup",
+      outcome: "unhealthy"
+    }, 1);
+    expectMetric(initial, "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "unhealthy"
+    }, 1);
 
     await context.service.start();
-    expect(context.metrics.collect()).toContain('probe="startup",outcome="ok"} 1');
-    expect(context.metrics.collect()).toContain('probe="readiness",outcome="ok"} 1');
+    expectMetric(context.metrics.collect(), "nutsnews_worker_health_probe", {
+      probe: "startup",
+      outcome: "ok"
+    }, 1);
+    expectMetric(context.metrics.collect(), "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "ok"
+    }, 1);
     expect(context.metrics.collect().split("\n").filter((line) => line.startsWith("# HELP nutsnews_worker_health_probe "))).toHaveLength(1);
     expect(context.telemetry.events.some((event) =>
       event.name === "runtime.health.evaluated" && event.attributes?.probe === "readiness"
     )).toBe(true);
 
     await context.service.consumer?.cancel();
-    expect(context.metrics.collect()).toContain('probe="readiness",outcome="unhealthy"} 1');
+    expectMetric(context.metrics.collect(), "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "unhealthy"
+    }, 1);
 
     await context.service.stop();
-    expect(context.metrics.collect()).toContain('probe="startup",outcome="unhealthy"} 1');
+    expectMetric(context.metrics.collect(), "nutsnews_worker_health_probe", {
+      probe: "startup",
+      outcome: "unhealthy"
+    }, 1);
   });
 
   it("starts, becomes ready, registers fetch and canonicalization routes, and drains cleanly", async () => {
@@ -110,7 +136,7 @@ describe("createFetcherService", () => {
     expect(metrics).toContain('nutsnews_worker_uplift_stage_latency_seconds_bucket{environment="local",service="fetch",le="+Inf"} 2');
     expect(metrics).toContain('nutsnews_worker_uplift_stage_latency_seconds_sum{environment="local",service="fetch"} 0.125');
     expect(metrics).toContain('nutsnews_worker_uplift_stage_latency_seconds_count{environment="local",service="fetch"} 2');
-    expect(metrics).toMatch(new RegExp(`nutsnews_worker_last_success_timestamp_seconds\\{[^\\n]+\\} ${String(Date.parse("2026-07-23T00:00:00.150Z") / 1_000)}`, "u"));
+    expect(metrics).toMatch(new RegExp(`nutsnews_worker_last_success_timestamp_seconds\\{[^\\n]+\\} ${String(Math.floor(Date.parse("2026-07-23T00:00:00.150Z") / 1_000))}`, "u"));
 
     await context.service.stop();
   });
@@ -259,8 +285,14 @@ describe("createFetcherService", () => {
       expect(context.service.broker.state).toBe("closed");
       expect(context.service.consumer).toBeUndefined();
       expect(context.service.isStarted).toBe(false);
-      expect(context.metrics.collect()).toContain('probe="startup",outcome="unhealthy"} 1');
-      expect(context.metrics.collect()).toContain('probe="readiness",outcome="unhealthy"} 1');
+      expectMetric(context.metrics.collect(), "nutsnews_worker_health_probe", {
+        probe: "startup",
+        outcome: "unhealthy"
+      }, 1);
+      expectMetric(context.metrics.collect(), "nutsnews_worker_health_probe", {
+        probe: "readiness",
+        outcome: "unhealthy"
+      }, 1);
 
       const queued = await queuedOutcome;
 
@@ -301,7 +333,11 @@ describe("createFetcherService", () => {
         (reason: unknown) => reason
       );
 
-      expect(context.metrics.collect()).toContain('probe="readiness",outcome="unhealthy"} 1');
+      await context.service.health.readiness();
+      expectMetric(context.metrics.collect(), "nutsnews_worker_health_probe", {
+        probe: "readiness",
+        outcome: "unhealthy"
+      }, 1);
       expect((await context.service.health.readiness()).checks.find((check) => check.name === "not-stopping")?.status).toBe("unhealthy");
 
       await vi.advanceTimersByTimeAsync(1_000);
@@ -312,8 +348,14 @@ describe("createFetcherService", () => {
       expect(context.service.broker.state).toBe("closed");
       expect(context.service.consumer).toBeUndefined();
       expect(context.service.isStarted).toBe(false);
-      expect(context.metrics.collect()).toContain('probe="startup",outcome="unhealthy"} 1');
-      expect(context.metrics.collect()).toContain('probe="readiness",outcome="unhealthy"} 1');
+      expectMetric(context.metrics.collect(), "nutsnews_worker_health_probe", {
+        probe: "startup",
+        outcome: "unhealthy"
+      }, 1);
+      expectMetric(context.metrics.collect(), "nutsnews_worker_health_probe", {
+        probe: "readiness",
+        outcome: "unhealthy"
+      }, 1);
     } finally {
       vi.useRealTimers();
     }
@@ -357,12 +399,14 @@ describe("createFetcherService", () => {
         claim: delegate.claim.bind(delegate),
         markCompleted: delegate.markCompleted.bind(delegate),
         markFailed: delegate.markFailed.bind(delegate),
+        releaseClaim: delegate.releaseClaim.bind(delegate),
         getFeedMetadata: delegate.getFeedMetadata.bind(delegate),
         recordFetchOutcome: delegate.recordFetchOutcome.bind(delegate),
         claimCandidate: delegate.claimCandidate.bind(delegate),
         markCandidatePublished: delegate.markCandidatePublished.bind(delegate),
         markCandidatePublishFailed: delegate.markCandidatePublishFailed.bind(delegate),
-        listPendingCandidatePublications: delegate.listPendingCandidatePublications.bind(delegate)
+        listPendingCandidatePublications: delegate.listPendingCandidatePublications.bind(delegate),
+        claimPendingCandidatePublications: delegate.claimPendingCandidatePublications.bind(delegate)
       };
       const dependencies = createLocalFetcherDependencies({
         stateStore
@@ -391,7 +435,10 @@ describe("createFetcherService", () => {
       expect(service.broker.state).toBe("idle");
       expect(metrics.collect()).toMatch(/nutsnews_worker_state_store_ready\{[^\n]+\} 0/u);
 
-      await service.stop();
+      const stopping = service.stop();
+
+      await vi.advanceTimersByTimeAsync(100);
+      await stopping;
     } finally {
       vi.useRealTimers();
     }
@@ -411,7 +458,58 @@ describe("createFetcherService", () => {
       queue: "nutsnews.worker.fetch.v1",
       activeConsumers: 0
     });
+    const metrics = context.metrics.collect();
+
+    expectMetric(metrics, "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "unhealthy"
+    }, 1);
+    expectMetric(metrics, "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "ok"
+    }, 0);
+    expectMetric(metrics, "nutsnews_worker_health_check", {
+      probe: "readiness",
+      check: "rabbitmq-consumer",
+      outcome: "unhealthy"
+    }, 1);
+    expectMetric(metrics, "nutsnews_worker_health_check", {
+      probe: "readiness",
+      check: "rabbitmq-consumer",
+      outcome: "ok"
+    }, 0);
     expect(context.metrics.collect()).toContain('nutsnews_worker_expected_active{environment="local",service="nutsnews-worker-feed-fetcher"} 0');
+
+    await context.service.stop();
+  });
+
+  it("refreshes aggregate and per-check readiness metrics when the broker channel drops", async () => {
+    const broker = new LocalBrokerTransport();
+    const context = createServiceContext({
+      brokerTransport: broker
+    });
+
+    await context.service.start();
+    broker.simulateChannelDrop();
+
+    await vi.waitFor(() => {
+      const metrics = context.metrics.collect();
+
+      expectMetric(metrics, "nutsnews_worker_health_probe", {
+        probe: "readiness",
+        outcome: "unhealthy"
+      }, 1);
+      expectMetric(metrics, "nutsnews_worker_health_check", {
+        probe: "readiness",
+        check: "rabbitmq-consumer",
+        outcome: "unhealthy"
+      }, 1);
+    });
+
+    const readiness = await context.service.health.readiness();
+
+    expect(readiness.status).toBe("unhealthy");
+    expect(readiness.checks.find((check) => check.name === "rabbitmq-consumer")?.status).toBe("unhealthy");
 
     await context.service.stop();
   });
@@ -453,10 +551,10 @@ describe("createFetcherService", () => {
     expect(JSON.stringify(readiness)).not.toContain("broker-secret");
     expect(context.metrics.collect()).toMatch(/nutsnews_worker_state_store_ready\{[^\n]+outcome="unsupported"[^\n]+\} 0/u);
     expect(context.telemetry.events.some((event) =>
-      event.name === "runtime.health.evaluated" &&
-      event.attributes?.probe === "state-store-startup" &&
+      event.name === "runtime.dependency.observed" &&
+      event.attributes?.dependency === "state-store" &&
       event.attributes.actualMode === "unsupported" &&
-      event.outcome === "unhealthy"
+      event.outcome === "failure"
     )).toBe(true);
 
     await context.service.stop();
@@ -510,7 +608,12 @@ describe("createFetcherService", () => {
       brokerAdapterMode: "test",
       reason: "production-adapter-mismatch"
     });
-    expect(mixedContext.metrics.collect()).toContain('nutsnews_worker_deployment_info{adapter="mixed",deployment="shadow",environment="local",service="nutsnews-worker-feed-fetcher"} 1');
+    expectMetric(mixedContext.metrics.collect(), "nutsnews_worker_deployment_info", {
+      adapter: "mixed",
+      deployment: "shadow",
+      environment: "local",
+      service: "nutsnews-worker-feed-fetcher"
+    }, 1);
 
     await mixedContext.service.stop();
 
@@ -567,9 +670,6 @@ describe("createFetcherService", () => {
       setStateStoreReady: () => {
         throw new Error("metric state unavailable");
       },
-      setHealthProbe: () => {
-        throw new Error("metric health unavailable");
-      }
     };
     const service = createFetcherService({
       config,
@@ -718,11 +818,28 @@ function testPostgresqlStateStore(status: FetcherDependencyProbe["status"]): Fet
     claim: delegate.claim.bind(delegate),
     markCompleted: delegate.markCompleted.bind(delegate),
     markFailed: delegate.markFailed.bind(delegate),
+    releaseClaim: delegate.releaseClaim.bind(delegate),
     getFeedMetadata: delegate.getFeedMetadata.bind(delegate),
     recordFetchOutcome: delegate.recordFetchOutcome.bind(delegate),
     claimCandidate: delegate.claimCandidate.bind(delegate),
     markCandidatePublished: delegate.markCandidatePublished.bind(delegate),
     markCandidatePublishFailed: delegate.markCandidatePublishFailed.bind(delegate),
-    listPendingCandidatePublications: delegate.listPendingCandidatePublications.bind(delegate)
+    listPendingCandidatePublications: delegate.listPendingCandidatePublications.bind(delegate),
+    claimPendingCandidatePublications: delegate.claimPendingCandidatePublications.bind(delegate)
   };
+}
+
+function expectMetric(
+  output: string,
+  name: string,
+  labels: Readonly<Record<string, string>>,
+  value: string | number
+): void {
+  const line = output.split("\n").find((candidate) =>
+    candidate.startsWith(`${name}{`)
+    && candidate.endsWith(` ${String(value)}`)
+    && Object.entries(labels).every(([label, labelValue]) => candidate.includes(`${label}="${labelValue}"`))
+  );
+
+  expect(line, `${name} with ${JSON.stringify(labels)}=${String(value)}`).toBeDefined();
 }

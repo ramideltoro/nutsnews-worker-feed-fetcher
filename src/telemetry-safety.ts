@@ -6,8 +6,6 @@ import type {
 
 import type {
   FetcherBaseMetricsSink,
-  FetcherHealthOutcome,
-  FetcherHealthProbe,
   FetcherPrometheusMetricsSink
 } from "./metrics.js";
 
@@ -124,9 +122,6 @@ export function bestEffortFetcherMetricsSink(
     allowedLabels: sink.allowedLabels,
     setStateStoreReady: (ready: boolean): void => {
       safely(() => sink.setStateStoreReady(ready));
-    },
-    setHealthProbe: (probe: FetcherHealthProbe, outcome: FetcherHealthOutcome): void => {
-      safely(() => sink.setHealthProbe(probe, outcome));
     }
   };
 }
@@ -151,9 +146,7 @@ function isFetcherMetrics(
   sink: FetcherBaseMetricsSink | FetcherPrometheusMetricsSink
 ): sink is FetcherPrometheusMetricsSink {
   return "setStateStoreReady" in sink
-    && typeof sink.setStateStoreReady === "function"
-    && "setHealthProbe" in sink
-    && typeof sink.setHealthProbe === "function";
+    && typeof sink.setStateStoreReady === "function";
 }
 
 function safely(operation: () => void): void {

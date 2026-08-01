@@ -16,6 +16,7 @@ import {
 } from "@ramideltoro/nutsnews-worker-runtime";
 import { getWorkerRoute } from "@ramideltoro/nutsnews-worker-contracts";
 
+import { isFetcherDefinitePublishError } from "../src/dependencies.js";
 import { PayloadRabbitMqTransport } from "../src/rabbitmq-transport.js";
 import {
   createMinimalCanonicalizationCommand,
@@ -33,6 +34,7 @@ interface FakeBroker {
 interface FakeBrokerOptions {
   readonly assertQueue?: (queue: string) => Promise<void>;
   readonly cancel?: (consumerTag: string) => Promise<void>;
+  readonly publishBehavior?: "backpressure" | "callback-error" | "channel-close" | "channel-error" | "never-confirm" | "returned" | "sync-error";
 }
 
 interface FakeConnection {
@@ -319,6 +321,84 @@ describe("RabbitMQ payload transport", () => {
     await transport.close();
   });
 
+  it("marks setup failure and mandatory return as definitely unpublished", async () => {
+    const command = createMinimalCanonicalizationCommand();
+    const setupFailure = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: () => Promise.reject(new Error("setup unavailable"))
+    });
+    const returnedBroker = createFakeBroker({
+      publishBehavior: "returned"
+    });
+    const returned = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: returnedBroker.connect
+    });
+
+    expect(isFetcherDefinitePublishError(await rejectedValue(setupFailure.publish(command)))).toBe(true);
+    expect(isFetcherDefinitePublishError(await rejectedValue(returned.publish(command)))).toBe(true);
+
+    await returned.close();
+  });
+
+  it.each([
+    "callback-error",
+    "channel-close",
+    "channel-error",
+    "sync-error"
+  ] as const)("keeps %s publish failures ambiguous", async (publishBehavior) => {
+    const broker = createFakeBroker({ publishBehavior });
+    const transport = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: broker.connect
+    });
+
+    expect(isFetcherDefinitePublishError(await rejectedValue(
+      transport.publish(createMinimalCanonicalizationCommand())
+    ))).toBe(false);
+
+    await transport.close();
+  });
+
+  it("keeps confirm timeout ambiguous and treats false return as backpressure", async () => {
+    vi.useFakeTimers();
+    const timeoutBroker = createFakeBroker({
+      publishBehavior: "never-confirm"
+    });
+    const timeoutTransport = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: timeoutBroker.connect
+    });
+    const timedOut = rejectedValue(timeoutTransport.publish(createMinimalCanonicalizationCommand()));
+
+    await vi.runAllTimersAsync();
+    expect(isFetcherDefinitePublishError(await timedOut)).toBe(false);
+    await timeoutTransport.close();
+
+    const backpressureBroker = createFakeBroker({
+      publishBehavior: "backpressure"
+    });
+    const backpressureTransport = new PayloadRabbitMqTransport({
+      url: "amqp://fetcher:test@example.invalid:5672",
+      prefetch: 4,
+      clock,
+      connect: backpressureBroker.connect
+    });
+
+    await expect(backpressureTransport.publish(createMinimalCanonicalizationCommand())).resolves.toMatchObject({
+      confirmed: true
+    });
+    await backpressureTransport.close();
+  });
+
   it.each([
     {
       attempt: 1,
@@ -536,7 +616,7 @@ function createFakeChannel(options: FakeBrokerOptions): FakeChannel {
       exchange: string,
       routingKey: string,
       content: Buffer,
-      _options: unknown,
+      publishOptions: unknown,
       callback: (error: unknown) => void
     ): boolean {
       publishes.push({
@@ -544,10 +624,49 @@ function createFakeChannel(options: FakeBrokerOptions): FakeChannel {
         routingKey,
         content
       });
+
+      if (options.publishBehavior === "sync-error") {
+        throw new Error("simulated synchronous publish failure");
+      }
+      if (options.publishBehavior === "returned") {
+        const messageId = isRecordWithMessageId(publishOptions)
+          ? publishOptions.messageId
+          : undefined;
+
+        queueMicrotask(() => {
+          emitChannelEvent(eventHandlers, "return", {
+            properties: {
+              messageId
+            }
+          });
+        });
+        return true;
+      }
+      if (options.publishBehavior === "callback-error") {
+        queueMicrotask(() => {
+          callback(new Error("simulated confirm callback failure"));
+        });
+        return true;
+      }
+      if (options.publishBehavior === "channel-close") {
+        queueMicrotask(() => {
+          emitChannelEvent(eventHandlers, "close");
+        });
+        return true;
+      }
+      if (options.publishBehavior === "channel-error") {
+        queueMicrotask(() => {
+          emitChannelEvent(eventHandlers, "error");
+        });
+        return true;
+      }
+      if (options.publishBehavior === "never-confirm") {
+        return true;
+      }
       queueMicrotask(() => {
         callback(null);
       });
-      return true;
+      return options.publishBehavior !== "backpressure";
     },
     ack(message: ConsumeMessage): void {
       acknowledgements.push(message);
@@ -593,11 +712,29 @@ function createFakeChannel(options: FakeBrokerOptions): FakeChannel {
 
 function emitChannelEvent(
   handlers: ReadonlyMap<string, ReadonlySet<(...args: unknown[]) => void>>,
-  event: string
+  event: string,
+  ...args: unknown[]
 ): void {
   for (const handler of handlers.get(event) ?? []) {
-    handler();
+    handler(...args);
   }
+}
+
+function isRecordWithMessageId(value: unknown): value is { readonly messageId: string } {
+  return typeof value === "object"
+    && value !== null
+    && "messageId" in value
+    && typeof value.messageId === "string";
+}
+
+async function rejectedValue(promise: Promise<unknown>): Promise<unknown> {
+  try {
+    await promise;
+  } catch (error: unknown) {
+    return error;
+  }
+
+  throw new Error("Expected operation to reject.");
 }
 
 async function waitForSettlement(channel: FakeChannel): Promise<void> {

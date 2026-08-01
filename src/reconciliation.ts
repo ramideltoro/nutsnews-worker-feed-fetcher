@@ -5,7 +5,10 @@ import {
   type RuntimeClock
 } from "@ramideltoro/nutsnews-worker-runtime";
 
-import type { FetcherDurableStateStore } from "./dependencies.js";
+import {
+  isFetcherDefinitePublishError,
+  type FetcherDurableStateStore
+} from "./dependencies.js";
 
 export type FetcherReconciliationMode = "dry-run" | "apply";
 export type FetcherReconciliationStatus = "dry_run" | "applied" | "failed_closed" | "not_configured" | "unauthorized" | "kill_switch_active";
@@ -95,25 +98,25 @@ export function createFetcherOutboxReconciler(options: {
         });
       }
 
-      let pending: Awaited<ReturnType<FetcherDurableStateStore["listPendingCandidatePublications"]>>;
-
-      try {
-        pending = await options.stateStore.listPendingCandidatePublications({
-          maxItems: input.maxItems,
-          minAgeSeconds: input.minAgeSeconds
-        });
-      } catch (error: unknown) {
-        return report({
-          ...input,
-          status: "failed_closed",
-          failedClosedCount: 1,
-          errors: [
-            safeErrorName(error)
-          ]
-        });
-      }
-
       if (input.mode === "dry-run") {
+        let pending: Awaited<ReturnType<FetcherDurableStateStore["listPendingCandidatePublications"]>>;
+
+        try {
+          pending = await options.stateStore.listPendingCandidatePublications({
+            maxItems: input.maxItems,
+            minAgeSeconds: input.minAgeSeconds
+          });
+        } catch (error: unknown) {
+          return report({
+            ...input,
+            status: "failed_closed",
+            failedClosedCount: 1,
+            errors: [
+              safeErrorName(error)
+            ]
+          });
+        }
+
         return report({
           ...input,
           status: "dry_run",
@@ -132,43 +135,100 @@ export function createFetcherOutboxReconciler(options: {
       const errors: string[] = [];
       let replayedCount = 0;
       let failedClosedCount = 0;
+      let selectedCount = 0;
 
-      for (const candidate of pending) {
+      while (selectedCount < input.maxItems) {
+        let claimed: Awaited<ReturnType<FetcherDurableStateStore["claimPendingCandidatePublications"]>>;
+
         try {
-          const receipt = await options.publish(candidate.command);
-
-          await options.stateStore.markCandidatePublished(candidate.candidateId, {
-            publishedAt: receipt.confirmedAt,
-            messageId: receipt.messageId,
-            idempotencyKey: candidate.command.envelope.idempotencyKey,
-            claimOwnerKey: candidate.claimOwnerKey
-          });
-          replayedCount += 1;
-          candidates.push({
-            candidateId: candidate.candidateId,
-            messageId: receipt.messageId,
-            createdAt: candidate.createdAt,
-            outcome: "replayed"
+          // Claim one row immediately before its publish. A large preclaimed
+          // batch could let later leases expire while earlier confirms wait.
+          claimed = await options.stateStore.claimPendingCandidatePublications({
+            maxItems: 1,
+            minAgeSeconds: input.minAgeSeconds
           });
         } catch (error: unknown) {
           failedClosedCount += 1;
           errors.push(safeErrorName(error));
+          break;
+        }
+
+        const candidate = claimed[0];
+
+        if (candidate === undefined) {
+          break;
+        }
+
+        selectedCount += 1;
+
+        let receipt: BrokerPublishReceipt;
+
+        try {
+          receipt = await options.publish(candidate.command);
+        } catch (error: unknown) {
+          failedClosedCount += 1;
+          errors.push(safeErrorName(error));
+
+          if (isFetcherDefinitePublishError(error)) {
+            try {
+              await options.stateStore.markCandidatePublishFailed(candidate.candidateId, {
+                failedAt: runtimeNow(options.clock),
+                idempotencyKey: candidate.command.envelope.idempotencyKey,
+                claimToken: candidate.claimToken,
+                reason: safeErrorName(error)
+              });
+            } catch (recordError: unknown) {
+              errors.push(safeErrorName(recordError));
+            }
+          }
+
           candidates.push({
             candidateId: candidate.candidateId,
             messageId: candidate.command.envelope.messageId,
             createdAt: candidate.createdAt,
             outcome: "failed-closed"
           });
+          break;
         }
+
+        try {
+          await options.stateStore.markCandidatePublished(candidate.candidateId, {
+            publishedAt: receipt.confirmedAt,
+            messageId: receipt.messageId,
+            idempotencyKey: candidate.command.envelope.idempotencyKey,
+            claimToken: candidate.claimToken
+          });
+        } catch (error: unknown) {
+          // The broker confirmation is authoritative for the external side
+          // effect. A failed or lost persistence response remains fenced until
+          // lease expiry; marking it retrying here would duplicate immediately.
+          failedClosedCount += 1;
+          errors.push(safeErrorName(error));
+          candidates.push({
+            candidateId: candidate.candidateId,
+            messageId: receipt.messageId,
+            createdAt: candidate.createdAt,
+            outcome: "failed-closed"
+          });
+          break;
+        }
+
+        replayedCount += 1;
+        candidates.push({
+          candidateId: candidate.candidateId,
+          messageId: receipt.messageId,
+          createdAt: candidate.createdAt,
+          outcome: "replayed"
+        });
       }
 
       return report({
         ...input,
         status: failedClosedCount === 0 ? "applied" : "failed_closed",
-        selectedCount: pending.length,
+        selectedCount,
         replayedCount,
         failedClosedCount,
-        writesPerformed: replayedCount > 0,
+        writesPerformed: selectedCount > 0,
         candidates,
         errors
       });

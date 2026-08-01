@@ -131,14 +131,20 @@ describe("fetcher HTTP endpoints", () => {
 
     await service.start();
     await activeServer.listen();
-    expect(metrics.collect()).toContain('nutsnews_worker_health_probe{environment="local",service="fetch",probe="readiness",outcome="ok"} 1');
+    expectMetric(metrics.collect(), "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "ok"
+    }, 1);
 
     stateStore.status = "unhealthy";
     const metricsResponse = await fetch(activeServer.url("/metrics"));
     const metricsText = await metricsResponse.text();
 
     expect(metricsResponse.status).toBe(200);
-    expect(metricsText).toContain('nutsnews_worker_health_probe{environment="local",service="fetch",probe="readiness",outcome="unhealthy"} 1');
+    expectMetric(metricsText, "nutsnews_worker_health_probe", {
+      probe: "readiness",
+      outcome: "unhealthy"
+    }, 1);
     expect(metricsText).toMatch(/nutsnews_worker_state_store_ready\{[^\n]+\} 0/u);
 
     await service.stop();
@@ -262,18 +268,20 @@ describe("fetcher HTTP endpoints", () => {
     const stateStore = new InMemoryFetcherStateStore(clock);
     const command = createMinimalCanonicalizationCommand();
 
-    await stateStore.claimCandidate("candidate-world-one", {
+    const candidateClaim = await stateStore.claimCandidate("candidate-world-one", {
       feedId: "feed-world",
       sourceItemId: "guid-001",
       contentFingerprint: "fingerprint-v1",
       firstSeenAt: clock.now().toISOString(),
-      claimOwnerKey: command.envelope.messageId,
       command
     });
+    if (candidateClaim.status !== "claimed") {
+      throw new Error("Expected the test candidate to be claimed.");
+    }
     await stateStore.markCandidatePublishFailed("candidate-world-one", {
       failedAt: clock.now().toISOString(),
       idempotencyKey: command.envelope.idempotencyKey,
-      claimOwnerKey: command.envelope.messageId,
+      claimToken: candidateClaim.claimToken,
       reason: "BrokerPublishError"
     });
     const service = createFetcherService({
@@ -407,4 +415,19 @@ async function expectJsonStatus(url: string, statusCode: number, status: string)
 
   expect(response.status).toBe(statusCode);
   expect(body.status).toBe(status);
+}
+
+function expectMetric(
+  output: string,
+  name: string,
+  labels: Readonly<Record<string, string>>,
+  value: string | number
+): void {
+  const line = output.split("\n").find((candidate) =>
+    candidate.startsWith(`${name}{`)
+    && candidate.endsWith(` ${String(value)}`)
+    && Object.entries(labels).every(([label, labelValue]) => candidate.includes(`${label}="${labelValue}"`))
+  );
+
+  expect(line, `${name} with ${JSON.stringify(labels)}=${String(value)}`).toBeDefined();
 }

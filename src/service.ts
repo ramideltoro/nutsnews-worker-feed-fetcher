@@ -12,10 +12,7 @@ import {
   type BrokerConsumerHandle,
   type BrokerLifecycle,
   type RuntimeHealthCheck,
-  type RuntimeHealthProbe,
   type RuntimeHealthProbeSet,
-  type RuntimeHealthReport,
-  type RuntimeHealthStatus,
   type RuntimeMessageProcessingResult,
   type RuntimeMessageDelivery,
   type RuntimeTelemetrySink
@@ -31,8 +28,6 @@ import type {
 import { fetcherDependencyAdapterIdentity } from "./dependencies.js";
 import type {
   FetcherBaseMetricsSink,
-  FetcherHealthOutcome,
-  FetcherHealthProbe,
   FetcherPrometheusMetricsSink
 } from "./metrics.js";
 import { expectedFetcherStateStoreMode } from "./state-store.js";
@@ -113,13 +108,14 @@ export function createFetcherService(options: FetcherServiceOptions): FetcherSer
   let lifecycleGeneration = 0;
   let stopping = false;
   let stopOperation: Promise<void> | undefined;
+  let readinessStateOverride: StateStoreEvaluation | undefined;
 
   const service = {
     get broker(): BrokerLifecycle {
       return broker;
     },
     get health(): RuntimeHealthProbeSet {
-      return observeHealthProbeSet(createRuntimeHealthProbeSet({
+      return createRuntimeHealthProbeSet({
         livenessChecks: [
           livenessCheck()
         ],
@@ -133,13 +129,13 @@ export function createFetcherService(options: FetcherServiceOptions): FetcherSer
           dependencyReadinessCheck("http-client", options.dependencies.httpClient),
           dependencyReadinessCheck("dns-policy", options.dependencies.dnsPolicy),
           productionAdaptersReadinessCheck(options),
-          stateStoreReadinessCheck(options, metrics)
+          stateStoreReadinessCheck(options, metrics, () => readinessStateOverride)
         ],
         clock: options.dependencies.clock,
         ...(telemetry === undefined ? {} : {
           telemetry
         })
-      }), metrics);
+      });
     },
     get isStarted(): boolean {
       return started;
@@ -167,10 +163,15 @@ export function createFetcherService(options: FetcherServiceOptions): FetcherSer
 
       if (stateStore.status !== "ok" || productionAdapters.status !== "ok") {
         started = true;
-        setHealthProbe(metrics, "startup", "ok");
-        setHealthProbe(metrics, "readiness", "unhealthy");
         metrics?.setInFlight(fetchRoute.mainQueue.name, drain.inFlight);
         await emitStateStoreModeTelemetry(options, stateStore, productionAdapters, telemetry);
+        readinessStateOverride = stateStore;
+
+        try {
+          await seedServiceHealth(service.health);
+        } finally {
+          readinessStateOverride = undefined;
+        }
         return;
       }
 
@@ -203,16 +204,21 @@ export function createFetcherService(options: FetcherServiceOptions): FetcherSer
             if (consumer === serviceConsumer) {
               consumer = undefined;
             }
-            setHealthProbe(metrics, "readiness", "unhealthy");
+            await service.health.readiness();
           }
         }
       };
       consumer = serviceConsumer;
       started = true;
-      setHealthProbe(metrics, "startup", "ok");
       metrics?.setInFlight(fetchRoute.mainQueue.name, drain.inFlight);
       await emitStateStoreModeTelemetry(options, stateStore, productionAdapters, telemetry);
-      await service.health.readiness();
+      readinessStateOverride = stateStore;
+
+      try {
+        await seedServiceHealth(service.health);
+      } finally {
+        readinessStateOverride = undefined;
+      }
     },
     stop(): Promise<void> {
       if (stopOperation !== undefined) {
@@ -227,7 +233,6 @@ export function createFetcherService(options: FetcherServiceOptions): FetcherSer
         }
 
         stopping = true;
-        setHealthProbe(metrics, "readiness", "unhealthy");
         metrics?.setShutdownDraining(true);
         let shutdownError: Error | undefined;
 
@@ -271,10 +276,12 @@ export function createFetcherService(options: FetcherServiceOptions): FetcherSer
         } finally {
           metrics?.setInFlight(fetchRoute.mainQueue.name, drain.inFlight);
           started = false;
-          setHealthProbe(metrics, "startup", "unhealthy");
-          setHealthProbe(metrics, "readiness", "unhealthy");
           metrics?.setShutdownDraining(false);
           stopping = false;
+          await Promise.all([
+            service.health.startup(),
+            service.health.readiness()
+          ]);
         }
 
         if (shutdownError !== undefined) {
@@ -301,6 +308,46 @@ export function createFetcherService(options: FetcherServiceOptions): FetcherSer
       return processor(delivery);
     }
   } satisfies FetcherService;
+
+  let readinessRefreshQueued = false;
+  let readinessRefreshRunning = false;
+  const requestReadinessRefresh = (): void => {
+    // Startup seeds all probes with the already-bounded state-store result.
+    // Ignore monitor transitions until that seed is complete so an activation
+    // event cannot consume the dependency timeout a second time.
+    if (!started) {
+      return;
+    }
+
+    readinessRefreshQueued = true;
+
+    if (readinessRefreshRunning) {
+      return;
+    }
+
+    readinessRefreshRunning = true;
+    queueMicrotask(() => {
+      void (async (): Promise<void> => {
+        try {
+          // Consumer recovery can transition more than once while a health
+          // check is running. Re-evaluate until the newest bounded state has
+          // been represented by both the aggregate and per-check metrics.
+          while (readinessRefreshQueued) {
+            readinessRefreshQueued = false;
+            await service.health.readiness();
+          }
+        } finally {
+          readinessRefreshRunning = false;
+
+          if (readinessRefreshQueued) {
+            requestReadinessRefresh();
+          }
+        }
+      })().catch(() => undefined);
+    });
+  };
+
+  options.dependencies.brokerTransport.onConsumerStateChange?.(requestReadinessRefresh);
 
   return service;
 }
@@ -626,13 +673,17 @@ interface StateStoreEvaluation {
 
 function stateStoreReadinessCheck(
   options: FetcherServiceOptions,
-  metrics: FetcherBaseMetricsSink | FetcherPrometheusMetricsSink | undefined
+  metrics: FetcherBaseMetricsSink | FetcherPrometheusMetricsSink | undefined,
+  stateOverride: () => StateStoreEvaluation | undefined
 ): RuntimeHealthCheck {
   return {
     name: "durable-state",
     critical: true,
     check: async () => {
-      const stateStore = await evaluateStateStore(options);
+      // Startup already evaluated this dependency under the configured
+      // timeout. Reuse that exact result while seeding health metrics so a
+      // hung dependency cannot make startup consume the timeout twice.
+      const stateStore = stateOverride() ?? await evaluateStateStore(options);
 
       setStateStoreReady(metrics, stateStore.status === "ok");
 
@@ -740,14 +791,14 @@ async function emitStateStoreModeTelemetry(
   telemetry: RuntimeTelemetrySink | undefined
 ): Promise<void> {
   await emitRuntimeTelemetry(telemetry, {
-    name: "runtime.health.evaluated",
+    name: "runtime.dependency.observed",
     level: stateStore.status === "ok" ? "info" : "error",
     at: runtimeNow(options.dependencies.clock),
     stage: "fetch",
     queue: getWorkerRoute("fetch").mainQueue.name,
-    outcome: stateStore.status,
+    outcome: stateStore.status === "ok" ? "success" : "failure",
     attributes: {
-      probe: "state-store-startup",
+      dependency: "state-store",
       dependencyMode: options.config.dependencyMode,
       deploymentMode: options.config.deploymentMode,
       expectedActive: options.config.expectedActive,
@@ -772,42 +823,6 @@ async function emitStateStoreModeTelemetry(
   });
 }
 
-function observeHealthProbeSet(
-  probes: RuntimeHealthProbeSet,
-  metrics: FetcherBaseMetricsSink | FetcherPrometheusMetricsSink | undefined
-): RuntimeHealthProbeSet {
-  const observe = async (
-    probe: Extract<RuntimeHealthProbe, FetcherHealthProbe>,
-    evaluate: () => Promise<RuntimeHealthReport>
-  ): Promise<RuntimeHealthReport> => {
-    try {
-      const report = await evaluate();
-
-      setHealthProbe(metrics, probe, report.status);
-      return report;
-    } catch (error: unknown) {
-      setHealthProbe(metrics, probe, "unhealthy");
-      throw error;
-    }
-  };
-
-  return {
-    liveness: () => observe("liveness", () => probes.liveness()),
-    startup: () => observe("startup", () => probes.startup()),
-    readiness: () => observe("readiness", () => probes.readiness())
-  };
-}
-
-function setHealthProbe(
-  metrics: FetcherBaseMetricsSink | FetcherPrometheusMetricsSink | undefined,
-  probe: FetcherHealthProbe,
-  outcome: Extract<RuntimeHealthStatus, FetcherHealthOutcome>
-): void {
-  if (isFetcherMetrics(metrics)) {
-    metrics.setHealthProbe(probe, outcome);
-  }
-}
-
 function setStateStoreReady(
   metrics: FetcherBaseMetricsSink | FetcherPrometheusMetricsSink | undefined,
   ready: boolean
@@ -822,7 +837,13 @@ function isFetcherMetrics(
 ): metrics is FetcherPrometheusMetricsSink {
   return metrics !== undefined
     && "setStateStoreReady" in metrics
-    && typeof metrics.setStateStoreReady === "function"
-    && "setHealthProbe" in metrics
-    && typeof metrics.setHealthProbe === "function";
+    && typeof metrics.setStateStoreReady === "function";
+}
+
+async function seedServiceHealth(health: RuntimeHealthProbeSet): Promise<void> {
+  await Promise.all([
+    health.liveness(),
+    health.startup(),
+    health.readiness()
+  ]);
 }

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import {
   SYSTEM_RUNTIME_CLOCK,
   createInMemoryIdempotencyStore,
@@ -14,6 +16,7 @@ import type {
   FetcherCandidateClaimResult,
   FetcherCandidatePublication,
   FetcherCandidatePublicationFailure,
+  FetcherClaimedPendingCandidatePublication,
   FetcherDependencyProbe,
   FetcherDurableStateStore,
   FetcherFeedMetadata,
@@ -22,6 +25,7 @@ import type {
   FetcherPendingPublicationQuery,
   FetcherStateStoreMode
 } from "./dependencies.js";
+import { FETCHER_MAX_CLAIM_LEASE_MS } from "./dependencies.js";
 import {
   FetcherStateOwnershipError,
   PostgresFetcherStateStore,
@@ -50,13 +54,15 @@ export class InMemoryFetcherStateStore implements FetcherDurableStateStore {
   readonly outcomes: FetcherFetchOutcome[] = [];
   private readonly feedMetadata = new Map<string, FetcherFeedMetadata>();
   private readonly candidates = new Map<string, FetcherCandidatePublication>();
-  private readonly candidateClaims = new Map<string, FetcherCandidateClaim>();
+  private readonly candidateClaims = new Map<string, InMemoryCandidateClaim>();
   private readonly retryableCandidates = new Set<string>();
   private readonly store;
   private readonly clock: RuntimeClock;
+  private readonly leaseMs: number;
 
-  constructor(clock: RuntimeClock = SYSTEM_RUNTIME_CLOCK) {
+  constructor(clock: RuntimeClock = SYSTEM_RUNTIME_CLOCK, leaseMs: number = FETCHER_MAX_CLAIM_LEASE_MS) {
     this.clock = clock;
+    this.leaseMs = validatedLeaseMs(leaseMs);
     this.store = createInMemoryIdempotencyStore(clock);
   }
 
@@ -77,6 +83,10 @@ export class InMemoryFetcherStateStore implements FetcherDurableStateStore {
 
   markFailed(idempotencyKey: string, failure: RuntimeIdempotencyFailure): Promise<void> {
     return this.store.markFailed(idempotencyKey, failure);
+  }
+
+  releaseClaim(idempotencyKey: string, failure: RuntimeIdempotencyFailure) {
+    return this.store.releaseClaim(idempotencyKey, failure);
   }
 
   getFeedMetadata(feedId: string): Promise<FetcherFeedMetadata | undefined> {
@@ -117,36 +127,39 @@ export class InMemoryFetcherStateStore implements FetcherDurableStateStore {
     }
 
     const pending = this.candidateClaims.get(candidateId);
+    const nowMs = this.clock.now().getTime();
 
     if (pending !== undefined
-      && pending.claimOwnerKey !== claim.claimOwnerKey
+      && pending.expiresAtMs > nowMs
       && !this.retryableCandidates.has(candidateId)) {
       return Promise.resolve({
         status: "in-progress",
-        retryAfterMs: 1_000
+        retryAfterMs: Math.max(1_000, Math.min(60_000, pending.expiresAtMs - nowMs))
       });
     }
 
-    if (pending === undefined) {
-      this.candidateClaims.set(candidateId, claim);
-    } else if (pending.claimOwnerKey !== claim.claimOwnerKey) {
-      this.candidateClaims.set(candidateId, {
-        ...pending,
-        claimOwnerKey: claim.claimOwnerKey
-      });
-    }
+    const claimToken = randomUUID();
+    const storedClaim = pending?.claim ?? claim;
+
+    this.candidateClaims.set(candidateId, {
+      claim: storedClaim,
+      claimToken,
+      expiresAtMs: nowMs + this.leaseMs
+    });
     this.retryableCandidates.delete(candidateId);
 
     return Promise.resolve({
       status: "claimed",
-      command: pending?.command ?? claim.command
+      command: storedClaim.command,
+      claimToken
     });
   }
 
   markCandidatePublished(candidateId: string, publication: FetcherCandidatePublication): Promise<void> {
     const claim = this.candidateClaims.get(candidateId);
 
-    if (!publicationOwnedByClaim(claim, publication)) {
+    if (!publicationOwnedByClaim(claim, publication)
+      || (claim?.expiresAtMs ?? 0) <= this.clock.now().getTime()) {
       return Promise.reject(new FetcherStateOwnershipError("markCandidatePublished"));
     }
 
@@ -158,28 +171,69 @@ export class InMemoryFetcherStateStore implements FetcherDurableStateStore {
   markCandidatePublishFailed(candidateId: string, failure: FetcherCandidatePublicationFailure): Promise<void> {
     const claim = this.candidateClaims.get(candidateId);
 
-    if (!failureOwnedByClaim(claim, failure)) {
+    if (claim === undefined
+      || !failureOwnedByClaim(claim, failure)
+      || claim.expiresAtMs <= this.clock.now().getTime()) {
       return Promise.reject(new FetcherStateOwnershipError("markCandidatePublishFailed"));
     }
 
+    this.candidateClaims.set(candidateId, {
+      ...claim,
+      expiresAtMs: this.clock.now().getTime()
+    });
     this.retryableCandidates.add(candidateId);
     return Promise.resolve();
   }
 
   listPendingCandidatePublications(query: FetcherPendingPublicationQuery): Promise<readonly FetcherPendingCandidatePublication[]> {
     const oldestAllowed = this.clock.now().getTime() - (Math.max(0, query.minAgeSeconds) * 1_000);
+    const nowMs = this.clock.now().getTime();
 
     return Promise.resolve([...this.candidateClaims.entries()]
       .filter(([candidateId, claim]) => !this.candidates.has(candidateId)
-        && this.retryableCandidates.has(candidateId)
-        && Date.parse(claim.firstSeenAt) <= oldestAllowed)
+        && (this.retryableCandidates.has(candidateId) || claim.expiresAtMs <= nowMs)
+        && Date.parse(claim.claim.firstSeenAt) <= oldestAllowed)
       .slice(0, query.maxItems)
       .map(([candidateId, claim]) => ({
         candidateId,
-        claimOwnerKey: claim.claimOwnerKey,
-        command: claim.command,
-        createdAt: claim.firstSeenAt
+        command: claim.claim.command,
+        createdAt: claim.claim.firstSeenAt
       })));
+  }
+
+  claimPendingCandidatePublications(
+    query: FetcherPendingPublicationQuery
+  ): Promise<readonly FetcherClaimedPendingCandidatePublication[]> {
+    const nowMs = this.clock.now().getTime();
+    const oldestAllowed = nowMs - (Math.max(0, query.minAgeSeconds) * 1_000);
+    const candidates = [...this.candidateClaims.entries()]
+      .filter(([candidateId, claim]) => !this.candidates.has(candidateId)
+        && (this.retryableCandidates.has(candidateId) || claim.expiresAtMs <= nowMs)
+        && Date.parse(claim.claim.firstSeenAt) <= oldestAllowed)
+      // A replay claim is intentionally singular. Keeping this invariant at
+      // the state-store boundary prevents any caller from preclaiming a batch
+      // whose later leases could expire while earlier confirms are pending.
+      .slice(0, 1);
+
+    const claimed = candidates.map(([candidateId, current]) => {
+      const claimToken = randomUUID();
+
+      this.candidateClaims.set(candidateId, {
+        ...current,
+        claimToken,
+        expiresAtMs: nowMs + this.leaseMs
+      });
+      this.retryableCandidates.delete(candidateId);
+
+      return {
+        candidateId,
+        claimToken,
+        command: current.claim.command,
+        createdAt: current.claim.firstSeenAt
+      };
+    });
+
+    return Promise.resolve(claimed);
   }
 }
 
@@ -208,6 +262,10 @@ export class UnsupportedProductionFetcherStateStore implements FetcherDurableSta
     return unavailable("markFailed");
   }
 
+  releaseClaim(): Promise<never> {
+    return unavailable("releaseClaim");
+  }
+
   getFeedMetadata(): Promise<FetcherFeedMetadata | undefined> {
     return unavailable("getFeedMetadata");
   }
@@ -230,6 +288,10 @@ export class UnsupportedProductionFetcherStateStore implements FetcherDurableSta
 
   listPendingCandidatePublications(): Promise<readonly FetcherPendingCandidatePublication[]> {
     return unavailable("listPendingCandidatePublications");
+  }
+
+  claimPendingCandidatePublications(): Promise<readonly FetcherClaimedPendingCandidatePublication[]> {
+    return unavailable("claimPendingCandidatePublications");
   }
 
   close(): Promise<void> {
@@ -280,27 +342,41 @@ function unavailable<T>(operation: string): Promise<T> {
   return Promise.reject(new FetcherStateStoreUnavailableError(operation));
 }
 
+interface InMemoryCandidateClaim {
+  readonly claim: FetcherCandidateClaim;
+  readonly claimToken: string;
+  readonly expiresAtMs: number;
+}
+
 function publicationOwnedByClaim(
-  claim: FetcherCandidateClaim | undefined,
+  claim: InMemoryCandidateClaim | undefined,
   publication: FetcherCandidatePublication
 ): boolean {
   if (claim === undefined) {
     return false;
   }
 
-  return claim.claimOwnerKey === publication.claimOwnerKey
-    && claim.command.envelope.idempotencyKey === publication.idempotencyKey
-    && claim.command.envelope.messageId === publication.messageId;
+  return claim.claimToken === publication.claimToken
+    && claim.claim.command.envelope.idempotencyKey === publication.idempotencyKey
+    && claim.claim.command.envelope.messageId === publication.messageId;
 }
 
 function failureOwnedByClaim(
-  claim: FetcherCandidateClaim | undefined,
+  claim: InMemoryCandidateClaim | undefined,
   failure: FetcherCandidatePublicationFailure
 ): boolean {
   if (claim === undefined) {
     return false;
   }
 
-  return claim.claimOwnerKey === failure.claimOwnerKey
-    && claim.command.envelope.idempotencyKey === failure.idempotencyKey;
+  return claim.claimToken === failure.claimToken
+    && claim.claim.command.envelope.idempotencyKey === failure.idempotencyKey;
+}
+
+function validatedLeaseMs(leaseMs: number): number {
+  if (!Number.isInteger(leaseMs) || leaseMs <= 0 || leaseMs > FETCHER_MAX_CLAIM_LEASE_MS) {
+    throw new RangeError(`Fetcher claim lease must be an integer from 1 to ${String(FETCHER_MAX_CLAIM_LEASE_MS)} milliseconds.`);
+  }
+
+  return leaseMs;
 }

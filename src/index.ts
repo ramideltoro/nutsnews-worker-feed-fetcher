@@ -46,6 +46,7 @@ import {
 } from "./telemetry-safety.js";
 
 export {
+  FETCHER_CLAIM_SETTLEMENT_SAFETY_MS,
   FETCHER_CONFIG_SCHEMA,
   FETCHER_SERVICE_NAME,
   FETCHER_SERVICE_VERSION,
@@ -58,6 +59,7 @@ export type {
   FetcherCandidateClaimResult,
   FetcherCandidatePublication,
   FetcherCandidatePublicationFailure,
+  FetcherClaimedPendingCandidatePublication,
   FetcherCandidateReference,
   FetcherAggregateAdapterMode,
   FetcherBrokerTransport,
@@ -80,7 +82,12 @@ export type {
   FetcherWorkTools,
   FetcherWorkHandler
 } from "./dependencies.js";
-export { fetcherDependencyAdapterIdentity } from "./dependencies.js";
+export {
+  FetcherDefinitePublishError,
+  FETCHER_MAX_CLAIM_LEASE_MS,
+  fetcherDependencyAdapterIdentity,
+  isFetcherDefinitePublishError
+} from "./dependencies.js";
 export {
   createFetcherHttpServer,
   type FetcherHttpServer
@@ -365,7 +372,8 @@ function reconciliationTokenFromEnv(): string | undefined {
   return token === undefined || token.length === 0 ? undefined : token;
 }
 
-export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "0.5.0";
+export const SUPPORTED_CONTRACTS_PACKAGE_VERSION = "1.0.0";
+export const SUPPORTED_RUNTIME_PACKAGE_VERSION = "1.0.0";
 
 function assertPackageCompatibility(): void {
   const contracts = getContractPackageMetadata();
@@ -373,7 +381,7 @@ function assertPackageCompatibility(): void {
   const contractsVersion: string = contracts.packageVersion;
   const runtimeVersion: string = runtime.packageVersion;
 
-  if (contractsVersion !== "0.3.1") {
+  if (contractsVersion !== SUPPORTED_CONTRACTS_PACKAGE_VERSION) {
     throw new Error(`Unsupported contracts package version ${contractsVersion}.`);
   }
 
