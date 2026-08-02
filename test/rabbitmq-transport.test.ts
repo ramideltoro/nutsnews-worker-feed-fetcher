@@ -123,7 +123,7 @@ describe("RabbitMQ payload transport", () => {
     expect(broker.connections[1]?.channel.prefetchCalls).toEqual([
       4
     ]);
-    expect(broker.connections[1]?.channel.assertedQueues).toContain("nutsnews.worker.fetch.v1");
+    expect(broker.connections[1]?.channel.assertedQueues).toEqual([]);
     expect(transport.consumerStatus("fetch")).toMatchObject({
       state: "active",
       activeConsumers: 1
@@ -173,7 +173,7 @@ describe("RabbitMQ payload transport", () => {
     await transport.close();
   });
 
-  it("asserts exchanges, queues, and bindings for input and output routes", async () => {
+  it("uses backend-provisioned topology without configure operations", async () => {
     const broker = createFakeBroker();
     const transport = new PayloadRabbitMqTransport({
       url: "amqp://fetcher:test@example.invalid:5672",
@@ -191,64 +191,29 @@ describe("RabbitMQ payload transport", () => {
 
     const channel = broker.connections[0]?.channel;
 
-    expect(channel?.assertedExchanges).toEqual([
-      fetchRoute.exchange,
-      fetchRoute.retryExchange,
-      fetchRoute.dlqExchange
-    ]);
-    expect(channel?.assertedQueues).toEqual(expect.arrayContaining([
-      fetchRoute.mainQueue.name,
-      ...fetchRoute.retryQueues.map((queue) => queue.name),
-      fetchRoute.terminalDlq.name,
-      canonicalizationRoute.mainQueue.name,
-      ...canonicalizationRoute.retryQueues.map((queue) => queue.name),
-      canonicalizationRoute.terminalDlq.name
-    ]));
-    expect(channel?.bindings).toContainEqual({
-      queue: canonicalizationRoute.mainQueue.name,
-      exchange: canonicalizationRoute.exchange,
-      routingKey: canonicalizationRoute.routingKey
-    });
+    expect(channel?.assertedExchanges).toEqual([]);
+    expect(channel?.assertedQueues).toEqual([]);
+    expect(channel?.bindings).toEqual([]);
 
     await transport.close();
   });
 
-  it("does not publish through a channel before topology initialization completes", async () => {
-    let releaseTopology!: () => void;
-    let markTopologyEntered!: () => void;
-    const topologyGate = new Promise<void>((resolve) => {
-      releaseTopology = resolve;
-    });
-    const topologyEntered = new Promise<void>((resolve) => {
-      markTopologyEntered = resolve;
-    });
-    const broker = createFakeBroker({
-      assertQueue: async () => {
-        markTopologyEntered();
-        await topologyGate;
-      }
-    });
+  it("publishes without attempting to mutate backend-managed topology", async () => {
+    const broker = createFakeBroker();
     const transport = new PayloadRabbitMqTransport({
       url: "amqp://fetcher:test@example.invalid:5672",
       prefetch: 4,
       clock,
       connect: broker.connect
     });
-    const topology = transport.assertTopology([
+    await transport.assertTopology([
       getWorkerRoute("canonicalization")
     ]);
+    await transport.publish(createMinimalCanonicalizationCommand());
 
-    await topologyEntered;
-    const publication = transport.publish(createMinimalCanonicalizationCommand());
-
-    await Promise.resolve();
-    expect(broker.connections[0]?.channel.publishes).toHaveLength(0);
-
-    releaseTopology();
-    await Promise.all([
-      topology,
-      publication
-    ]);
+    expect(broker.connections[0]?.channel.assertedExchanges).toEqual([]);
+    expect(broker.connections[0]?.channel.assertedQueues).toEqual([]);
+    expect(broker.connections[0]?.channel.bindings).toEqual([]);
     expect(broker.connections[0]?.channel.publishes).toHaveLength(1);
 
     await transport.close();
